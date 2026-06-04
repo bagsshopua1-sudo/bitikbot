@@ -36,6 +36,30 @@ const processedTickers = new Map();
 const TICKER_TTL_MS    = 24 * 60 * 60 * 1000;
 let initialized = false;
 
+// ─── Кеш балансу (оптимізація 1) ─────────────────────────────────────────────
+let cachedBalance = null;
+let balanceUpdatedAt = 0;
+const BALANCE_TTL_MS = 5000;
+
+async function getCachedBalance() {
+  const now = Date.now();
+  if (cachedBalance && (now - balanceUpdatedAt) < BALANCE_TTL_MS) {
+    return cachedBalance;
+  }
+  const account = await gateRequest('GET', '/futures/usdt/accounts', null, null);
+  cachedBalance = parseFloat(account.available);
+  balanceUpdatedAt = now;
+  return cachedBalance;
+}
+
+setInterval(async () => {
+  try {
+    const account = await gateRequest('GET', '/futures/usdt/accounts', null, null);
+    cachedBalance = parseFloat(account.available);
+    balanceUpdatedAt = Date.now();
+  } catch(e) {}
+}, BALANCE_TTL_MS);
+
 setInterval(() => {
   const now = Date.now();
   for (const [t, ts] of processedTickers.entries()) {
@@ -43,19 +67,16 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000);
 
-// ─── Telegram ─────────────────────────────────────────────────────────────────
-async function sendTelegram(text) {
+// ─── Telegram асинхронно (оптимізація 3) ─────────────────────────────────────
+function sendTelegram(text) {
   if (!CONFIG.TELEGRAM_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) return;
-  try {
-    const agent = CONFIG.TELEGRAM_PROXY ? new SocksProxyAgent(CONFIG.TELEGRAM_PROXY) : undefined;
-    await axios.post(
-      `https://api.telegram.org/bot${CONFIG.TELEGRAM_TOKEN}/sendMessage`,
-      { chat_id: CONFIG.TELEGRAM_CHAT_ID, text },
-      agent ? { httpsAgent: agent } : {}
-    );
-  } catch (e) {
-    log('ERROR', `Telegram: ${e.message}`);
-  }
+  const agent = CONFIG.TELEGRAM_PROXY ? new SocksProxyAgent(CONFIG.TELEGRAM_PROXY) : undefined;
+  axios.post(
+    `https://api.telegram.org/bot${CONFIG.TELEGRAM_TOKEN}/sendMessage`,
+    { chat_id: CONFIG.TELEGRAM_CHAT_ID, text },
+    agent ? { httpsAgent: agent } : {}
+  ).then(() => log('INFO', 'Telegram sent'))
+   .catch(e => log('ERROR', `Telegram: ${e.message}`));
 }
 
 // ─── Gate.io ──────────────────────────────────────────────────────────────────
@@ -78,6 +99,7 @@ async function gateRequest(method, endpoint, query, data) {
     url: qs ? `${url}?${qs}` : url,
     headers: { 'KEY': CONFIG.GATE_API_KEY, 'SIGN': sig, 'Timestamp': ts, 'Content-Type': 'application/json' },
     data: data || undefined,
+    timeout: 5000,
   });
   return res.data;
 }
@@ -85,7 +107,7 @@ async function gateRequest(method, endpoint, query, data) {
 async function contractExists(ticker) {
   const contract = `${ticker}_USDT`;
   try {
-    const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts/${contract}`);
+    const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts/${contract}`, { timeout: 5000 });
     return {
       exists: true, contract,
       markPrice: parseFloat(res.data.mark_price),
@@ -117,35 +139,18 @@ async function openOrderWithRetry(contract, size) {
   }
 }
 
-// ─── Витягуємо тікери ─────────────────────────────────────────────────────────
-function extractTickers(title) {
-  const matches = [];
-  const usdtMatches = title.match(/\b([A-Z]{2,10})USDT\b/g) || [];
-  usdtMatches.forEach(m => matches.push(m.replace('USDT', '')));
-  const bracketMatches = title.match(/\(([A-Z]{2,10})\)/g) || [];
-  bracketMatches.forEach(m => matches.push(m.replace(/[()]/g, '')));
-  const skipTokens = ['USDT', 'USD', 'BTC', 'ETH', 'BNB', 'BUSD', 'USDM', 'AED'];
-  return [...new Set(matches)].filter(t => !skipTokens.includes(t));
-}
-
-// ─── Відкриття позиції з урахуванням розподілу балансу ───────────────────────
-async function openPosition(ticker, marginPercent, seenAt, title) {
-  if (processedTickers.has(ticker)) {
-    log('INFO', `${ticker} already processed`);
-    return false;
-  }
+// ─── Відкриття позиції ────────────────────────────────────────────────────────
+async function openPosition(ticker, marginPercent, seenAt) {
+  if (processedTickers.has(ticker)) return false;
   processedTickers.set(ticker, Date.now());
 
-  log('INFO', `Trying to open: ${ticker} (margin: ${marginPercent}%)`);
+  log('INFO', `Opening [Binance]: ${ticker} (${marginPercent}% margin)`);
 
-  // Чекаємо до 30 сек поки контракт з'явиться на Gate.io
-  let contractData = null;
-  for (let i = 0; i < 10; i++) {
-    contractData = await contractExists(ticker);
-    if (contractData.exists) break;
-    log('INFO', `Waiting for ${ticker}_USDT on Gate.io... (${i+1}/10)`);
-    await new Promise(r => setTimeout(r, 3000));
-  }
+  // Оптимізація 4: паралельно перевіряємо контракт і баланс
+  const [contractData, available] = await Promise.all([
+    contractExists(ticker),
+    getCachedBalance(),
+  ]);
 
   if (!contractData.exists) {
     log('WARN', `No Gate.io contract for ${ticker}`);
@@ -153,15 +158,11 @@ async function openPosition(ticker, marginPercent, seenAt, title) {
   }
 
   const { contract, markPrice, quanto } = contractData;
-  const account = await gateRequest('GET', '/futures/usdt/accounts', null, null);
-  const available = parseFloat(account.available);
 
-  try {
-    await gateRequest('POST', `/futures/usdt/positions/${contract}/leverage`,
-      { leverage: '0', cross_leverage_limit: String(CONFIG.LEVERAGE) }, null);
-  } catch(e) {
-    log('WARN', `Leverage: ${e.response?.data?.message || e.message}`);
-  }
+  // Плече паралельно (не чекаємо)
+  gateRequest('POST', `/futures/usdt/positions/${contract}/leverage`,
+    { leverage: '0', cross_leverage_limit: String(CONFIG.LEVERAGE) }, null
+  ).catch(e => log('WARN', `Leverage: ${e.response?.data?.message || e.message}`));
 
   const useMargin = available * (marginPercent / 100);
   const size = Math.max(1, Math.floor((useMargin * CONFIG.LEVERAGE) / (markPrice * quanto)));
@@ -172,94 +173,77 @@ async function openPosition(ticker, marginPercent, seenAt, title) {
     order = await openOrderWithRetry(contract, size);
   } catch (e) {
     log('ERROR', `All retries failed for ${ticker}: ${e.response?.data?.message || e.message}`);
-    await sendTelegram(`ПОМИЛКА ${contract}: ${e.response?.data?.message || e.message}`);
+    sendTelegram(`ПОМИЛКА [Binance] ${contract}: ${e.response?.data?.message || e.message}`);
     return false;
   }
 
   const entryPrice = parseFloat(order.fill_price) || markPrice;
   const elapsedSec = ((Date.now() - seenAt) / 1000).toFixed(2);
 
-  await sendTelegram(
-    `ПОЗИЦІЯ ВІДКРИТА\n\n` +
-    `Джерело: BINANCE ANNOUNCE\n` +
+  // Скидаємо кеш балансу
+  cachedBalance = null;
+
+  sendTelegram(
+    `ПОЗИЦІЯ ВІДКРИТА [Binance]\n\n` +
     `Монета: ${ticker}\n` +
     `Контракт: ${contract}\n` +
     `Ціна входу: ${entryPrice} USDT\n` +
-    `Розмір: $${posValue} (${marginPercent}% балансу)\n` +
+    `Розмір: $${posValue} (${marginPercent}%)\n` +
     `Плече: ${CONFIG.LEVERAGE}x\n` +
     `Швидкість: ${elapsedSec} сек`
   );
 
-  log('INFO', `Opened ${contract} entry=${entryPrice} value=$${posValue} speed=${elapsedSec}s`);
+  log('INFO', `Opened ${contract} entry=${entryPrice} speed=${elapsedSec}s`);
   return true;
 }
 
-// ─── Обробка лістингу з розподілом балансу ───────────────────────────────────
-async function handleListing(tickers, title, seenAt) {
-  log('INFO', `Processing ${tickers.length} tickers: ${tickers.join(', ')}`);
+// ─── Розподіл балансу між тікерами ───────────────────────────────────────────
+async function handleListing(tickers, seenAt) {
+  // Оптимізація 4: паралельно перевіряємо всі контракти
+  const checks = await Promise.all(tickers.map(t => contractExists(t)));
+  const available = tickers.filter((t, i) => checks[i].exists);
+  const notAvailable = tickers.filter((t, i) => !checks[i].exists);
 
-  // Визначаємо який відсоток балансу на кожен тікер
-  // 1 тікер → 90%, 2 тікери → 40% кожен, 3+ → рівномірно
+  if (notAvailable.length > 0) {
+    log('WARN', `Not on Gate.io: ${notAvailable.join(', ')}`);
+    sendTelegram(`Binance лістинг — немає на Gate.io: ${notAvailable.join(', ')}`);
+  }
+
+  // Розподіл балансу
   let marginPerTicker;
-  if (tickers.length === 1) {
-    marginPerTicker = 90;
-  } else if (tickers.length === 2) {
-    marginPerTicker = 40;
-  } else {
-    marginPerTicker = Math.floor(80 / tickers.length);
-  }
+  if (available.length === 0) return;
+  if (tickers.length === 1) marginPerTicker = 90;
+  else if (tickers.length === 2 && available.length === 1) marginPerTicker = 90;
+  else if (tickers.length === 2) marginPerTicker = 40;
+  else marginPerTicker = Math.floor(80 / available.length);
 
-  // Спочатку перевіряємо які тікери є на Gate.io
-  const available = [];
-  const notAvailable = [];
+  // Оптимізація 4: відкриваємо всі позиції ПАРАЛЕЛЬНО
+  await Promise.all(available.map(ticker => openPosition(ticker, marginPerTicker, seenAt)));
 
-  for (const ticker of tickers) {
-    const { exists } = await contractExists(ticker);
-    if (exists) {
-      available.push(ticker);
-    } else {
-      notAvailable.push(ticker);
-    }
-  }
-
-  log('INFO', `Available on Gate.io: ${available.join(', ') || 'none'}`);
-  log('INFO', `Not available: ${notAvailable.join(', ') || 'none'}`);
-
-  // Якщо є недоступні — повідомляємо
+  // Чекаємо недоступні
   if (notAvailable.length > 0) {
-    await sendTelegram(
-      `Binance анонс: ${title}\n\n` +
-      `Немає на Gate.io: ${notAvailable.join(', ')}\n` +
-      `Торгуємо тільки: ${available.join(', ') || 'нічого'}`
-    );
-  }
-
-  // Якщо доступний тільки 1 з 2 — використовуємо більший відсоток
-  let finalMargin = marginPerTicker;
-  if (tickers.length === 2 && available.length === 1) {
-    finalMargin = 90; // весь баланс на єдиний доступний
-    log('INFO', `Only 1 of 2 available — using 90% margin`);
-  }
-
-  // Відкриваємо позиції ПАРАЛЕЛЬНО
-  await Promise.all(available.map(ticker => openPosition(ticker, finalMargin, seenAt, title)));
-
-  // Чекаємо недоступні — може з'являться пізніше
-  if (notAvailable.length > 0) {
-    log('INFO', `Waiting for unavailable tickers: ${notAvailable.join(', ')}`);
     for (const ticker of notAvailable) {
-      // Чекаємо до 30 сек
       for (let i = 0; i < 10; i++) {
         const { exists } = await contractExists(ticker);
         if (exists) {
-          log('INFO', `${ticker} appeared on Gate.io!`);
-          await openPosition(ticker, available.length > 0 ? marginPerTicker : 90, seenAt, title);
+          await openPosition(ticker, available.length > 0 ? 40 : 90, seenAt);
           break;
         }
         await new Promise(r => setTimeout(r, 3000));
       }
     }
   }
+}
+
+// ─── Витягуємо тікери ─────────────────────────────────────────────────────────
+function extractTickers(title) {
+  const matches = [];
+  const usdtMatches = title.match(/\b([A-Z]{2,10})USDT\b/g) || [];
+  usdtMatches.forEach(m => matches.push(m.replace('USDT', '')));
+  const bracketMatches = title.match(/\(([A-Z]{2,10})\)/g) || [];
+  bracketMatches.forEach(m => matches.push(m.replace(/[()]/g, '')));
+  const skipTokens = ['USDT', 'USD', 'BTC', 'ETH', 'BNB', 'BUSD', 'USDM', 'AED'];
+  return [...new Set(matches)].filter(t => !skipTokens.includes(t));
 }
 
 // ─── Парсинг анонсів ──────────────────────────────────────────────────────────
@@ -290,7 +274,6 @@ async function tick() {
 
       const title = article.title || '';
       const titleLower = title.toLowerCase();
-
       log('INFO', `New article: ${title}`);
 
       if (SKIP_WORDS.some(w => titleLower.includes(w))) {
@@ -299,19 +282,18 @@ async function tick() {
       }
 
       if (!LISTING_WORDS.some(w => titleLower.includes(w))) {
-        await sendTelegram(`Binance анонс (перевір вручну):\n${title}`);
+        sendTelegram(`Binance анонс (перевір вручну):\n${title}`);
         continue;
       }
 
       const tickers = extractTickers(title);
       if (tickers.length === 0) {
-        log('WARN', `No tickers in: ${title}`);
-        await sendTelegram(`Binance лістинг без тікера:\n${title}`);
+        sendTelegram(`Binance лістинг без тікера:\n${title}`);
         continue;
       }
 
-      log('INFO', `Tickers found: ${tickers.join(', ')}`);
-      await handleListing(tickers, title, seenAt);
+      log('INFO', `Tickers: ${tickers.join(', ')}`);
+      await handleListing(tickers, seenAt);
     }
   } catch (e) {
     log('ERROR', `Tick: ${e.message}`);
@@ -322,38 +304,34 @@ async function tick() {
 
 async function main() {
   log('INFO', '══════════════════════════════════════');
-  log('INFO', ' Binance Announce Bot — starting up');
+  log('INFO', ' Binance Announce Bot v2 — starting up');
   log('INFO', '══════════════════════════════════════');
-  log('INFO', `LEV=${CONFIG.LEVERAGE}x | 1 ticker=90% | 2 tickers=40% each`);
+  log('INFO', `LEV=${CONFIG.LEVERAGE}x | Optimized: cache+async+parallel`);
 
-  await sendTelegram(
-    'Binance Announce Bot запущен\n' +
-    'Парсинг анонсів кожні 2 сек\n' +
-    `Плече: ${CONFIG.LEVERAGE}x\n` +
-    '1 тікер = 90% балансу\n' +
-    '2 тікери = 40% кожен\n' +
-    'Якщо 1 з 2 недоступний = 90% на доступний'
+  sendTelegram(
+    'Binance Announce Bot v2 запущен\n' +
+    'Оптимізації: кеш балансу + async TG + паралельні запити\n' +
+    `Плече: ${CONFIG.LEVERAGE}x`
   );
 
   await tick();
   setInterval(tick, CONFIG.POLL_INTERVAL_MS);
 }
 
-// Повідомлення при падінні
-process.on('uncaughtException', async (e) => {
+process.on('uncaughtException', (e) => {
   log('ERROR', `Uncaught: ${e.message}`);
-  try { await sendTelegram(`BINANCE БОТ ВПАВ!\nПомилка: ${e.message}\nПерезапускається...`); } catch(_) {}
-  process.exit(1);
+  sendTelegram(`BINANCE БОТ ВПАВ!\n${e.message}\nПерезапускається...`);
+  setTimeout(() => process.exit(1), 1000);
 });
 
-process.on('unhandledRejection', async (e) => {
+process.on('unhandledRejection', (e) => {
   log('ERROR', `Unhandled: ${e?.message || e}`);
-  try { await sendTelegram(`BINANCE БОТ ВПАВ!\nПомилка: ${e?.message || e}\nПерезапускається...`); } catch(_) {}
-  process.exit(1);
+  sendTelegram(`BINANCE БОТ ВПАВ!\n${e?.message || e}\nПерезапускається...`);
+  setTimeout(() => process.exit(1), 1000);
 });
 
-main().catch(async e => {
+main().catch(e => {
   log('ERROR', `Fatal: ${e.message}`);
-  try { await sendTelegram(`BINANCE БОТ ВПАВ!\nПомилка: ${e.message}\nПерезапускається...`); } catch(_) {}
-  process.exit(1);
+  sendTelegram(`BINANCE БОТ ВПАВ!\n${e.message}`);
+  setTimeout(() => process.exit(1), 1000);
 });
