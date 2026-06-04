@@ -184,13 +184,17 @@ async function openPosition(ticker, marginPercent, seenAt) {
   cachedBalance = null;
 
   sendTelegram(
-    `ПОЗИЦІЯ ВІДКРИТА [Binance]\n\n` +
-    `Монета: ${ticker}\n` +
-    `Контракт: ${contract}\n` +
-    `Ціна входу: ${entryPrice} USDT\n` +
-    `Розмір: $${posValue} (${marginPercent}%)\n` +
-    `Плече: ${CONFIG.LEVERAGE}x\n` +
-    `Швидкість: ${elapsedSec} сек`
+    `🟢 ─────────────────────\n` +
+    `   ПОЗИЦІЯ ВІДКРИТА\n` +
+    `─────────────────────\n` +
+    `📌 Монета:    ${ticker}\n` +
+    `🔗 Джерело:   BINANCE\n` +
+    `📄 Контракт:  ${contract}\n` +
+    `💵 Ціна входу: ${entryPrice} USDT\n` +
+    `📊 Розмір:    $${posValue} (${marginPercent}%)\n` +
+    `⚡️ Плече:     ${CONFIG.LEVERAGE}x\n` +
+    `⏱ Швидкість:  ${elapsedSec} сек\n` +
+    `─────────────────────`
   );
 
   log('INFO', `Opened ${contract} entry=${entryPrice} speed=${elapsedSec}s`);
