@@ -236,6 +236,7 @@ async function processCommands() {
     const updates = res.data.result || [];
 
     for (const update of updates) {
+      if (update.update_id <= lastUpdateId) continue;
       lastUpdateId = update.update_id;
       const msg = update.message;
       if (!msg || !msg.text) continue;
