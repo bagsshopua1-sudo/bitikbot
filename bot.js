@@ -24,12 +24,19 @@ const CONFIG = {
   POLL_INTERVAL_MS: 2000,
   GATE_BASE:        'https://api.gateio.ws/api/v4',
   UPBIT_CRIX_URL:   'https://crix-static.upbit.com/v2/crix_master',
+  BINANCE_SPOT_URL: 'https://api.binance.com/api/v3/exchangeInfo',
+  BINANCE_FUTURES_URL: 'https://fapi.binance.com/fapi/v1/exchangeInfo',
   ORDER_RETRIES:    10,
   ORDER_RETRY_MS:   300,
 };
 
-const knownCoins = new Map();
-let initialized = false;
+// ─── State ────────────────────────────────────────────────────────────────────
+const knownUpbitCoins    = new Map();
+const knownBinanceSpot   = new Set();
+const knownBinanceFutures = new Set();
+let upbitInitialized    = false;
+let binanceInitialized  = false;
+
 const processedTickers = new Map();
 const TICKER_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -44,8 +51,7 @@ setInterval(() => {
 async function sendTelegram(text) {
   if (!CONFIG.TELEGRAM_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) return;
   try {
-    const proxyUrl = CONFIG.TELEGRAM_PROXY;
-    const agent = proxyUrl ? new SocksProxyAgent(proxyUrl) : undefined;
+    const agent = CONFIG.TELEGRAM_PROXY ? new SocksProxyAgent(CONFIG.TELEGRAM_PROXY) : undefined;
     await axios.post(
       `https://api.telegram.org/bot${CONFIG.TELEGRAM_TOKEN}/sendMessage`,
       { chat_id: CONFIG.TELEGRAM_CHAT_ID, text },
@@ -96,7 +102,7 @@ async function contractExists(ticker) {
   }
 }
 
-// ─── Відкриття позиції з retry ────────────────────────────────────────────────
+// ─── Retry ордер ──────────────────────────────────────────────────────────────
 async function openOrderWithRetry(contract, size) {
   for (let attempt = 1; attempt <= CONFIG.ORDER_RETRIES; attempt++) {
     try {
@@ -107,7 +113,7 @@ async function openOrderWithRetry(contract, size) {
       return order;
     } catch (e) {
       const msg = e.response?.data?.message || e.message;
-      log('WARN', `Order attempt ${attempt}/${CONFIG.ORDER_RETRIES} failed: ${msg}`);
+      log('WARN', `Attempt ${attempt}/${CONFIG.ORDER_RETRIES}: ${msg}`);
       if (attempt < CONFIG.ORDER_RETRIES) {
         await new Promise(r => setTimeout(r, CONFIG.ORDER_RETRY_MS));
       } else {
@@ -117,20 +123,20 @@ async function openOrderWithRetry(contract, size) {
   }
 }
 
-// ─── Обробка тікера ───────────────────────────────────────────────────────────
-async function handleNewListing(ticker, coinData, seenAt) {
+// ─── Відкриття позиції ────────────────────────────────────────────────────────
+async function handleNewListing(ticker, source, seenAt) {
   if (processedTickers.has(ticker)) {
-    log('INFO', `Ticker ${ticker} already processed, skipping`);
+    log('INFO', `${ticker} already processed, skipping`);
     return;
   }
   processedTickers.set(ticker, Date.now());
 
-  log('INFO', `NEW LISTING: ${ticker}`);
+  log('INFO', `NEW LISTING [${source}]: ${ticker}`);
 
   const { exists, contract, markPrice, quanto } = await contractExists(ticker);
   if (!exists) {
     log('WARN', `No Gate.io contract for ${ticker}`);
-    await sendTelegram(`No contract for ${ticker} on Gate.io Futures`);
+    await sendTelegram(`[${source}] Немає контракту для ${ticker} на Gate.io`);
     return;
   }
 
@@ -148,66 +154,53 @@ async function handleNewListing(ticker, coinData, seenAt) {
   const size = Math.max(1, Math.floor((useMargin * CONFIG.LEVERAGE) / (markPrice * quanto)));
   const posValue = (size * markPrice * quanto).toFixed(2);
 
-  log('INFO', `Opening: ${contract} size=${size} price=${markPrice} value=$${posValue}`);
-
   let order;
   try {
     order = await openOrderWithRetry(contract, size);
   } catch (e) {
-    log('ERROR', `All ${CONFIG.ORDER_RETRIES} attempts failed: ${e.response?.data?.message || e.message}`);
-    await sendTelegram(`ПОМИЛКА ОРДЕРА ${contract}: ${e.response?.data?.message || e.message}`);
+    log('ERROR', `All retries failed: ${e.response?.data?.message || e.message}`);
+    await sendTelegram(`ПОМИЛКА [${source}] ${contract}: ${e.response?.data?.message || e.message}`);
     return;
   }
 
   const entryPrice = parseFloat(order.fill_price) || markPrice;
   const elapsedSec = ((Date.now() - seenAt) / 1000).toFixed(2);
-  const now = new Date().toISOString();
 
   await sendTelegram(
     `ПОЗИЦІЯ ВІДКРИТА\n\n` +
+    `Джерело: ${source}\n` +
     `Монета: ${ticker}\n` +
     `Контракт: ${contract}\n` +
     `Ціна входу: ${entryPrice} USDT\n` +
     `Розмір: $${posValue}\n` +
-    `Плече: ${CONFIG.LEVERAGE}x (крос)\n` +
-    `Спроб: до ${CONFIG.ORDER_RETRIES} з інтервалом ${CONFIG.ORDER_RETRY_MS}мс\n` +
-    `Швидкість: ${elapsedSec} сек\n` +
-    `Час: ${now}`
+    `Плече: ${CONFIG.LEVERAGE}x\n` +
+    `Швидкість: ${elapsedSec} сек`
   );
 
-  log('INFO', `Opened ${contract} entry=${entryPrice} value=$${posValue} speed=${elapsedSec}s`);
+  log('INFO', `[${source}] Opened ${contract} entry=${entryPrice} value=$${posValue} speed=${elapsedSec}s`);
 }
 
-// ─── Upbit ────────────────────────────────────────────────────────────────────
-async function fetchUpbitCoins() {
-  const res = await axios.get(CONFIG.UPBIT_CRIX_URL, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0',
-      'Accept': 'application/json',
-      'Origin': 'https://upbit.com',
-      'Referer': 'https://upbit.com/',
-    },
-    timeout: 10000,
-  });
-  return Array.isArray(res.data) ? res.data : [];
-}
+// ─── Upbit тік ────────────────────────────────────────────────────────────────
+let upbitRunning = false;
 
-let isRunning = false;
-
-async function tick() {
-  if (isRunning) return;
-  isRunning = true;
+async function tickUpbit() {
+  if (upbitRunning) return;
+  upbitRunning = true;
   try {
-    const coins = await fetchUpbitCoins();
+    const res = await axios.get(CONFIG.UPBIT_CRIX_URL, {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json', 'Origin': 'https://upbit.com' },
+      timeout: 10000,
+    });
+    const coins = Array.isArray(res.data) ? res.data : [];
     const seenAt = Date.now();
 
-    if (!initialized) {
+    if (!upbitInitialized) {
       for (const coin of coins) {
         const code = coin.code || coin.baseCurrencyCode;
-        if (code) knownCoins.set(code, coin);
+        if (code) knownUpbitCoins.set(code, coin);
       }
-      log('INFO', `Initialized with ${knownCoins.size} coins from Upbit`);
-      initialized = true;
+      log('INFO', `[Upbit] Initialized with ${knownUpbitCoins.size} coins`);
+      upbitInitialized = true;
       return;
     }
 
@@ -216,37 +209,108 @@ async function tick() {
       if (!code) continue;
       if (coin.quoteCurrencyCode !== 'KRW') continue;
       if (coin.marketState !== 'ACTIVE') continue;
-
-      if (!knownCoins.has(coin.code || code)) {
-        log('INFO', `NEW COIN: ${code} (${coin.englishName})`);
-        knownCoins.set(coin.code || code, coin);
-        await handleNewListing(code, coin, seenAt);
+      if (!knownUpbitCoins.has(coin.code || code)) {
+        knownUpbitCoins.set(coin.code || code, coin);
+        await handleNewListing(code, 'UPBIT', seenAt);
       }
     }
   } catch (e) {
-    log('ERROR', `Tick: ${e.message}`);
+    log('ERROR', `[Upbit] Tick: ${e.message}`);
   } finally {
-    isRunning = false;
+    upbitRunning = false;
   }
 }
 
+// ─── Binance тік ──────────────────────────────────────────────────────────────
+let binanceRunning = false;
+
+async function tickBinance() {
+  if (binanceRunning) return;
+  binanceRunning = true;
+  try {
+    const seenAt = Date.now();
+
+    // Spot
+    const spotRes = await axios.get(CONFIG.BINANCE_SPOT_URL, { timeout: 10000 });
+    const spotSymbols = spotRes.data.symbols
+      .filter(s => s.quoteAsset === 'USDT' && s.status === 'TRADING')
+      .map(s => s.baseAsset);
+
+    // Futures
+    const futRes = await axios.get(CONFIG.BINANCE_FUTURES_URL, { timeout: 10000 });
+    const futSymbols = futRes.data.symbols
+      .filter(s => s.quoteAsset === 'USDT' && s.status === 'TRADING')
+      .map(s => s.baseAsset);
+
+    if (!binanceInitialized) {
+      spotSymbols.forEach(s => knownBinanceSpot.add(s));
+      futSymbols.forEach(s => knownBinanceFutures.add(s));
+      log('INFO', `[Binance] Initialized: ${knownBinanceSpot.size} spot, ${knownBinanceFutures.size} futures`);
+      binanceInitialized = true;
+      return;
+    }
+
+    // Нові на споті
+    for (const symbol of spotSymbols) {
+      if (!knownBinanceSpot.has(symbol)) {
+        knownBinanceSpot.add(symbol);
+        log('INFO', `[Binance Spot] New: ${symbol}`);
+        await handleNewListing(symbol, 'BINANCE_SPOT', seenAt);
+      }
+    }
+
+    // Нові на ф'ючерсах
+    for (const symbol of futSymbols) {
+      if (!knownBinanceFutures.has(symbol)) {
+        knownBinanceFutures.add(symbol);
+        log('INFO', `[Binance Futures] New: ${symbol}`);
+        await handleNewListing(symbol, 'BINANCE_FUTURES', seenAt);
+      }
+    }
+  } catch (e) {
+    log('ERROR', `[Binance] Tick: ${e.message}`);
+  } finally {
+    binanceRunning = false;
+  }
+}
+
+// ─── Старт ────────────────────────────────────────────────────────────────────
 async function main() {
   log('INFO', '══════════════════════════════════════');
-  log('INFO', ' Upbit Listing Bot v2 — starting up');
+  log('INFO', ' Upbit + Binance Listing Bot v3');
   log('INFO', '══════════════════════════════════════');
   log('INFO', `LEV=${CONFIG.LEVERAGE}x | Retry: ${CONFIG.ORDER_RETRIES}x/${CONFIG.ORDER_RETRY_MS}ms`);
 
   await sendTelegram(
-    'Upbit Listing Bot v2 запущен\n' +
-    'Метод: crix_master API\n' +
-    `Retry ордеру: ${CONFIG.ORDER_RETRIES} спроб по ${CONFIG.ORDER_RETRY_MS}мс`
+    'Listing Bot v3 запущен\n' +
+    'Джерела: Upbit + Binance Spot + Binance Futures\n' +
+    `Плече: ${CONFIG.LEVERAGE}x | Retry: ${CONFIG.ORDER_RETRIES}x`
   );
 
-  await tick();
-  setInterval(tick, CONFIG.POLL_INTERVAL_MS);
+  // Ініціалізація
+  await tickUpbit();
+  await tickBinance();
+
+  // Опитування кожні 2 секунди
+  setInterval(tickUpbit, CONFIG.POLL_INTERVAL_MS);
+  setInterval(tickBinance, CONFIG.POLL_INTERVAL_MS);
 }
 
-main().catch(e => {
+// Повідомлення при падінні
+process.on('uncaughtException', async (e) => {
+  log('ERROR', `Uncaught: ${e.message}`);
+  try { await sendTelegram(`UPBIT БОТ ВПАВ!\nПомилка: ${e.message}\nПерезапускається...`); } catch(_) {}
+  process.exit(1);
+});
+
+process.on('unhandledRejection', async (e) => {
+  log('ERROR', `Unhandled: ${e?.message || e}`);
+  try { await sendTelegram(`UPBIT БОТ ВПАВ!\nПомилка: ${e?.message || e}\nПерезапускається...`); } catch(_) {}
+  process.exit(1);
+});
+
+main().catch(async e => {
   log('ERROR', `Fatal: ${e.message}`);
+  try { await sendTelegram(`UPBIT БОТ ВПАВ!\nПомилка: ${e.message}\nПерезапускається...`); } catch(_) {}
   process.exit(1);
 });
