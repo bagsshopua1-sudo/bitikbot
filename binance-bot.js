@@ -241,10 +241,8 @@ async function handleListing(tickers, title, seenAt) {
     log('INFO', `Only 1 of 2 available — using 90% margin`);
   }
 
-  // Відкриваємо позиції
-  for (const ticker of available) {
-    await openPosition(ticker, finalMargin, seenAt, title);
-  }
+  // Відкриваємо позиції ПАРАЛЕЛЬНО
+  await Promise.all(available.map(ticker => openPosition(ticker, finalMargin, seenAt, title)));
 
   // Чекаємо недоступні — може з'являться пізніше
   if (notAvailable.length > 0) {
