@@ -223,7 +223,7 @@ async function cmdStatus(chatId) {
 }
 
 // ─── Polling команд ───────────────────────────────────────────────────────────
-let lastUpdateId = 0;
+let lastUpdateId = -1;
 
 async function processCommands() {
   try {
@@ -273,8 +273,26 @@ async function processCommands() {
   }
 }
 
+async function initLastUpdateId() {
+  try {
+    const agent = getAgent();
+    const res = await axios.get(
+      `https://api.telegram.org/bot${CONFIG.TELEGRAM_TOKEN}/getUpdates?offset=-1`,
+      agent ? { httpsAgent: agent, timeout: 10000 } : { timeout: 10000 }
+    );
+    const updates = res.data.result || [];
+    if (updates.length > 0) {
+      lastUpdateId = updates[updates.length - 1].update_id;
+    }
+    console.log(`Initialized lastUpdateId: ${lastUpdateId}`);
+  } catch(e) {
+    console.error(`Init error: ${e.message}`);
+  }
+}
+
 async function main() {
   console.log('Telegram Commands Bot — starting');
+  await initLastUpdateId();
   await sendTelegram(
     `🤖 ─────────────────────\n` +
     `  КОМАНДИ АКТИВОВАНІ!\n` +
