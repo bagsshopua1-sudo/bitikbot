@@ -339,7 +339,21 @@ async function main() {
   setInterval(tick, CONFIG.POLL_INTERVAL_MS);
 }
 
-main().catch(e => {
+// Повідомлення при падінні
+process.on('uncaughtException', async (e) => {
+  log('ERROR', `Uncaught: ${e.message}`);
+  try { await sendTelegram(`BINANCE БОТ ВПАВ!\nПомилка: ${e.message}\nПерезапускається...`); } catch(_) {}
+  process.exit(1);
+});
+
+process.on('unhandledRejection', async (e) => {
+  log('ERROR', `Unhandled: ${e?.message || e}`);
+  try { await sendTelegram(`BINANCE БОТ ВПАВ!\nПомилка: ${e?.message || e}\nПерезапускається...`); } catch(_) {}
+  process.exit(1);
+});
+
+main().catch(async e => {
   log('ERROR', `Fatal: ${e.message}`);
+  try { await sendTelegram(`BINANCE БОТ ВПАВ!\nПомилка: ${e.message}\nПерезапускається...`); } catch(_) {}
   process.exit(1);
 });
