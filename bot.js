@@ -187,13 +187,17 @@ async function handleNewListing(ticker, seenAt) {
   cachedBalance = null;
 
   sendTelegram(
-    `ПОЗИЦІЯ ВІДКРИТА [Upbit]\n\n` +
-    `Монета: ${ticker}\n` +
-    `Контракт: ${contract}\n` +
-    `Ціна входу: ${entryPrice} USDT\n` +
-    `Розмір: $${posValue}\n` +
-    `Плече: ${CONFIG.LEVERAGE}x\n` +
-    `Швидкість: ${elapsedSec} сек`
+    `🟢 ─────────────────────\n` +
+    `   ПОЗИЦІЯ ВІДКРИТА\n` +
+    `─────────────────────\n` +
+    `📌 Монета:    ${ticker}\n` +
+    `🔗 Джерело:   UPBIT\n` +
+    `📄 Контракт:  ${contract}\n` +
+    `💵 Ціна входу: ${entryPrice} USDT\n` +
+    `📊 Розмір:    $${posValue}\n` +
+    `⚡️ Плече:     ${CONFIG.LEVERAGE}x\n` +
+    `⏱ Швидкість:  ${elapsedSec} сек\n` +
+    `─────────────────────`
   );
 
   log('INFO', `Opened ${contract} entry=${entryPrice} speed=${elapsedSec}s`);
