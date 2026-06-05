@@ -146,20 +146,54 @@ async function gateRequest(method, endpoint, query, data) {
   return res.data;
 }
 
+// ─── Кеш контрактів Gate.io ───────────────────────────────────────────────────
+const contractsCache = new Map();
+let contractsCacheUpdatedAt = 0;
+const CONTRACTS_TTL = 5 * 60 * 1000;
+
+async function updateContractsCache() {
+  try {
+    const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts`, {
+      params: { limit: 1000 },
+      timeout: 10000,
+    });
+    contractsCache.clear();
+    for (const c of res.data) {
+      contractsCache.set(c.name, {
+        markPrice: parseFloat(c.mark_price),
+        quanto: parseFloat(c.quanto_multiplier || '1'),
+      });
+    }
+    contractsCacheUpdatedAt = Date.now();
+    log('INFO', `Contracts cache: ${contractsCache.size} contracts`);
+  } catch(e) {
+    log('ERROR', `Contracts cache failed: ${e.message}`);
+  }
+}
+
 // ─── Паралельна перевірка контракту і балансу (оптимізація 4) ────────────────
 async function contractExists(ticker) {
   const contract = `${ticker}_USDT`;
-  try {
-    const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts/${contract}`, { timeout: 5000 });
-    return {
-      exists: true, contract,
-      markPrice: parseFloat(res.data.mark_price),
-      quanto: parseFloat(res.data.quanto_multiplier || '1'),
-    };
-  } catch (e) {
-    if (e.response?.status === 404) return { exists: false, contract };
-    throw e;
+
+  if (Date.now() - contractsCacheUpdatedAt > CONTRACTS_TTL) {
+    await updateContractsCache();
   }
+
+  if (contractsCache.has(contract)) {
+    try {
+      const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts/${contract}`, { timeout: 3000 });
+      return {
+        exists: true, contract,
+        markPrice: parseFloat(res.data.mark_price),
+        quanto: parseFloat(res.data.quanto_multiplier || '1'),
+      };
+    } catch(e) {
+      const data = contractsCache.get(contract);
+      return { exists: true, contract, markPrice: data.markPrice, quanto: data.quanto };
+    }
+  }
+
+  return { exists: false, contract };
 }
 
 async function openOrderWithRetry(contract, size) {
@@ -446,6 +480,10 @@ async function main() {
     'Оптимізації: кеш балансу + async TG + паралельні запити\n' +
     `Плече: ${CONFIG.LEVERAGE}x`
   );
+
+  // Завантажуємо кеш контрактів
+  await updateContractsCache();
+  setInterval(updateContractsCache, CONTRACTS_TTL);
 
   // CoinListing WebSocket — миттєві лістинги Upbit
   startCoinListingWS();
