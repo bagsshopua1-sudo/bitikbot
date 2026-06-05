@@ -253,7 +253,7 @@ async function tick() {
   try {
     const res = await axios.get(CONFIG.UPBIT_CRIX_URL, {
       headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json', 'Origin': 'https://upbit.com' },
-      timeout: 10000,
+      timeout: 30000,
     });
     const coins = Array.isArray(res.data) ? res.data : [];
     const seenAt = Date.now();
@@ -302,19 +302,24 @@ async function main() {
   );
 
   await tick();
+  // Щогодинний heartbeat
+  setInterval(() => {
+    const now = new Date().toISOString();
+    log('INFO', 'Heartbeat — bot is alive');
+    sendTelegram(`✅ Upbit бот живий\n${now}`);
+  }, 60 * 60 * 1000);
+
   setInterval(tick, CONFIG.POLL_INTERVAL_MS);
 }
 
-process.on('uncaughtException', async (e) => {
+process.on('uncaughtException', (e) => {
   log('ERROR', `Uncaught: ${e.message}`);
-  sendTelegram(`UPBIT БОТ ВПАВ!\n${e.message}\nПерезапускається...`);
-  setTimeout(() => process.exit(1), 1000);
+  sendTelegram(`⚠️ UPBIT БОТ: помилка\n${e.message}\nПродовжує працювати...`);
 });
 
-process.on('unhandledRejection', async (e) => {
+process.on('unhandledRejection', (e) => {
   log('ERROR', `Unhandled: ${e?.message || e}`);
-  sendTelegram(`UPBIT БОТ ВПАВ!\n${e?.message || e}\nПерезапускається...`);
-  setTimeout(() => process.exit(1), 1000);
+  sendTelegram(`⚠️ UPBIT БОТ: помилка\n${e?.message || e}\nПродовжує працювати...`);
 });
 
 main().catch(e => {
