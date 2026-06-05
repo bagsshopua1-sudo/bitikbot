@@ -173,13 +173,20 @@ async function cmdSl(contract, price, chatId) {
 
 async function cmdClose(contract, chatId) {
   const pos = await gateRequest('GET', `/futures/usdt/positions/${contract}`, null, null);
+  
+  // В dual mode size може бути 0 але trade_long_size показує реальний розмір
+  const longSize = parseInt(pos.trade_long_size || 0);
+  const shortSize = parseInt(pos.trade_short_size || 0);
   const size = parseInt(pos.size);
-  if (size === 0) {
+  
+  const realSize = size !== 0 ? size : (longSize > 0 ? longSize : -shortSize);
+  
+  if (realSize === 0) {
     await sendTelegram(`❌ Немає позиції по ${contract}`, chatId);
     return;
   }
 
-  const closeSize = size > 0 ? -Math.abs(size) : Math.abs(size);
+  const closeSize = realSize > 0 ? -Math.abs(realSize) : Math.abs(realSize);
 
   await gateRequest('POST', '/futures/usdt/orders', null, {
     contract,
