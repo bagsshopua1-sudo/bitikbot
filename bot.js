@@ -327,13 +327,70 @@ async function tickNotices() {
   }
 }
 
-// ─── Upbit crix_master тік (резервний) ────────────────────────────────────────
+// ─── CoinListing WebSocket (миттєві лістинги Upbit) ──────────────────────────
+const WS_URL = 'wss://seoul.coinlisting.pro/listings?key=ilyak-2c3dbb';
+
+function startCoinListingWS() {
+  const ws = new (require('ws'))(WS_URL);
+
+  ws.on('open', () => {
+    log('INFO', '[CoinListing] Connected to seoul.coinlisting.pro');
+  });
+
+  ws.on('message', async (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === 'connection') {
+        log('INFO', `[CoinListing] Auth OK | tier=${msg.tier} | delay=${msg.delay_ms}ms`);
+        return;
+      }
+      if (msg.type === 'listing' || msg.ticker || msg.symbol) {
+        const ticker = msg.ticker || msg.symbol || msg.coin;
+        log('INFO', `[CoinListing] NEW LISTING: ${JSON.stringify(msg)}`);
+        if (ticker && ticker !== '***') {
+          await handleNewListing(ticker.replace('_USDT','').replace('/USDT',''), Date.now());
+        }
+      }
+    } catch(e) {
+      log('ERROR', `[CoinListing] Parse error: ${e.message}`);
+    }
+  });
+
+  ws.on('error', (e) => {
+    log('ERROR', `[CoinListing] Error: ${e.message}`);
+  });
+
+  ws.on('close', (code, reason) => {
+    log('WARN', `[CoinListing] Disconnected: ${code} — reconnecting in 3s...`);
+    sendTelegram(`⚠️ CoinListing WS відключився! Перепідключаємось...`);
+    setTimeout(startCoinListingWS, 3000);
+  });
+}
+
 let isRunning = false;
+let lastChecksum = null;
 
 async function tick() {
   if (isRunning) return;
   isRunning = true;
   try {
+    // Спочатку перевіряємо тільки checksum — маленький запит
+    const tsRes = await axios.get('https://crix-static.upbit.com/v2/crix_master_timestamp', {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Origin': 'https://upbit.com' },
+      timeout: 5000,
+    });
+
+    const checksum = tsRes.data?.checksum;
+
+    // Якщо checksum не змінився — пропускаємо
+    if (lastChecksum && lastChecksum === checksum) {
+      isRunning = false;
+      return;
+    }
+
+    lastChecksum = checksum;
+
+    // Checksum змінився → тягнемо повний список
     const res = await axios.get(CONFIG.UPBIT_CRIX_URL, {
       headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json', 'Origin': 'https://upbit.com' },
       timeout: 30000,
@@ -384,6 +441,9 @@ async function main() {
     `Плече: ${CONFIG.LEVERAGE}x`
   );
 
+  // CoinListing WebSocket — миттєві лістинги Upbit
+  startCoinListingWS();
+
   await tick();
   // Щогодинний heartbeat
   setInterval(() => {
@@ -394,9 +454,9 @@ async function main() {
 
   setInterval(tick, CONFIG.POLL_INTERVAL_MS);
 
-  // Анонси Upbit через проксі — реагуємо миттєво
+  // Анонси Upbit через проксі (резерв)
   await tickNotices();
-  setInterval(tickNotices, CONFIG.POLL_INTERVAL_MS);
+  setInterval(tickNotices, 60000);
 }
 
 process.on('uncaughtException', (e) => {
