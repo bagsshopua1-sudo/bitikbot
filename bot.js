@@ -153,7 +153,7 @@ const CONTRACTS_TTL = 5 * 60 * 1000;
 
 async function updateContractsCache() {
   try {
-    const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts`, {
+    const res = await axios.get('https://api.gateio.ws/api/v4/futures/usdt/contracts', {
       timeout: 10000,
     });
     contractsCache.clear();
