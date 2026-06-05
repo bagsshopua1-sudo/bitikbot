@@ -244,7 +244,90 @@ async function handleNewListing(ticker, seenAt) {
   log('INFO', `Opened ${contract} entry=${entryPrice} speed=${elapsedSec}s`);
 }
 
-// ─── Upbit тік ────────────────────────────────────────────────────────────────
+// ─── Upbit анонси через проксі ────────────────────────────────────────────────
+const seenNoticeIds = new Set();
+let noticesInitialized = false;
+
+const LISTING_KEYWORDS = ['추가', '신규 상장', '거래 지원', '디지털 자산 추가'];
+const SKIP_KEYWORDS = ['입출금', '점검', '이벤트', '중단', '종료', '폐지', '유의'];
+
+function extractTickerFromTitle(title) {
+  const matches = title.match(/\(([A-Z]{2,10})\)/g) || [];
+  return matches.map(m => m.replace(/[()]/g, ''));
+}
+
+let noticeRunning = false;
+
+async function tickNotices() {
+  if (noticeRunning) return;
+  noticeRunning = true;
+  try {
+    const agent = CONFIG.TELEGRAM_PROXY ? new SocksProxyAgent(CONFIG.TELEGRAM_PROXY) : undefined;
+    const res = await axios.get(
+      'https://api-manager.upbit.com/api/v1/announcements?os=moweb&page=1&per_page=20&category=all',
+      {
+        httpsAgent: agent,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
+          'Accept': 'application/json',
+          'Accept-Language': 'ko-KR,ko;q=0.9',
+          'Origin': 'https://upbit.com',
+          'Referer': 'https://upbit.com/service-center/notice',
+        },
+        timeout: 10000,
+      }
+    );
+
+    const notices = res.data?.data?.notices || [];
+    const seenAt = Date.now();
+
+    if (!noticesInitialized) {
+      notices.forEach(n => seenNoticeIds.add(n.id));
+      log('INFO', `[Upbit Notices] Initialized with ${seenNoticeIds.size} notices`);
+      noticesInitialized = true;
+      return;
+    }
+
+    for (const notice of notices) {
+      if (seenNoticeIds.has(notice.id)) continue;
+      seenNoticeIds.add(notice.id);
+
+      const title = notice.title || '';
+      log('INFO', `[Upbit Notice] New: ${title}`);
+
+      // Пропускаємо не лістинги
+      if (SKIP_KEYWORDS.some(w => title.includes(w))) {
+        log('INFO', `[Upbit Notice] Skip: ${title}`);
+        continue;
+      }
+
+      // Перевіряємо чи це лістинг
+      if (!LISTING_KEYWORDS.some(w => title.includes(w))) {
+        sendTelegram(`🟡 Upbit анонс (перевір):\n${title}`);
+        continue;
+      }
+
+      // Витягуємо тікери
+      const tickers = extractTickerFromTitle(title);
+      if (tickers.length === 0) {
+        sendTelegram(`🟡 Upbit лістинг без тікера:\n${title}`);
+        continue;
+      }
+
+      log('INFO', `[Upbit Notice] LISTING! Tickers: ${tickers.join(', ')}`);
+
+      for (const ticker of tickers) {
+        await handleNewListing(ticker, seenAt);
+      }
+    }
+  } catch (e) {
+    log('ERROR', `[Upbit Notices] Tick: ${e.message}`);
+  } finally {
+    noticeRunning = false;
+  }
+}
+
+// ─── Upbit crix_master тік (резервний) ────────────────────────────────────────
 let isRunning = false;
 
 async function tick() {
@@ -310,6 +393,10 @@ async function main() {
   }, 60 * 60 * 1000);
 
   setInterval(tick, CONFIG.POLL_INTERVAL_MS);
+
+  // Анонси Upbit через проксі — реагуємо миттєво
+  await tickNotices();
+  setInterval(tickNotices, CONFIG.POLL_INTERVAL_MS);
 }
 
 process.on('uncaughtException', (e) => {
