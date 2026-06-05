@@ -172,7 +172,6 @@ async function cmdSl(contract, price, chatId) {
 }
 
 async function cmdClose(contract, chatId) {
-  // Отримуємо всі відкриті ордери щоб знайти розмір
   const positions = await gateRequest('GET', '/futures/usdt/positions', null, null);
   const pos = positions.find(p => p.contract === contract && parseInt(p.size) !== 0);
 
@@ -189,6 +188,7 @@ async function cmdClose(contract, chatId) {
     size: closeSize,
     price: '0',
     tif: 'ioc',
+    reduce_only: true,
     text: 't-close-manual',
   });
 
