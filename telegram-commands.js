@@ -118,6 +118,7 @@ async function cmdTp(contract, price, chatId) {
     size: -size,
     price: price.toString(),
     tif: 'gtc',
+    reduce_only: true,
     text: 't-tp-manual',
   });
 
@@ -149,6 +150,7 @@ async function cmdSl(contract, price, chatId) {
       price: '0',
       tif: 'ioc',
       text: 't-sl-manual',
+      reduce_only: true,
     },
     trigger: {
       strategy_type: 0,
@@ -183,6 +185,7 @@ async function cmdClose(contract, chatId) {
     size: -size,
     price: '0',
     tif: 'ioc',
+    reduce_only: true,
     text: 't-close-manual',
   });
 
