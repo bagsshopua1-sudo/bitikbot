@@ -150,7 +150,6 @@ async function cmdSl(contract, price, chatId) {
       price: '0',
       tif: 'ioc',
       text: 't-sl-manual',
-      reduce_only: true,
     },
     trigger: {
       strategy_type: 0,
@@ -180,12 +179,13 @@ async function cmdClose(contract, chatId) {
     return;
   }
 
+  const closeSize = size > 0 ? -Math.abs(size) : Math.abs(size);
+
   await gateRequest('POST', '/futures/usdt/orders', null, {
     contract,
-    size: -size,
+    size: closeSize,
     price: '0',
     tif: 'ioc',
-    reduce_only: true,
     text: 't-close-manual',
   });
 
