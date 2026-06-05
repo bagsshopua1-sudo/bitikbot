@@ -140,14 +140,15 @@ async function cmdSl(contract, price, chatId) {
     return;
   }
 
+  const closeSize = size > 0 ? -Math.abs(size) : Math.abs(size);
+
   await gateRequest('POST', '/futures/usdt/price_orders', null, {
     initial: {
       contract,
-      size: -Math.abs(size),
-      price: price.toString(),
+      size: closeSize,
+      price: '0',
       tif: 'ioc',
       text: 't-sl-manual',
-      auto_size: size > 0 ? 'close_long' : 'close_short',
     },
     trigger: {
       strategy_type: 0,
