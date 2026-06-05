@@ -112,7 +112,6 @@ const CONTRACTS_TTL = 5 * 60 * 1000; // 5 хвилин
 async function updateContractsCache() {
   try {
     const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts`, {
-      params: { limit: 1000 },
       timeout: 10000,
     });
     contractsCache.clear();
