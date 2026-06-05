@@ -143,16 +143,17 @@ async function cmdSl(contract, price, chatId) {
   await gateRequest('POST', '/futures/usdt/price_orders', null, {
     initial: {
       contract,
-      size: -size,
+      size: -Math.abs(size),
       price: price.toString(),
-      tif: 'gtc',
+      tif: 'ioc',
       text: 't-sl-manual',
+      auto_size: size > 0 ? 'close_long' : 'close_short',
     },
     trigger: {
       strategy_type: 0,
       price_type: 1,
       price: price.toString(),
-      rule: parseInt(size) > 0 ? 2 : 1,
+      rule: size > 0 ? 2 : 1,
       expiration: 86400,
     },
   });
