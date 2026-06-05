@@ -104,15 +104,57 @@ async function gateRequest(method, endpoint, query, data) {
   return res.data;
 }
 
+// ─── Кеш контрактів Gate.io ───────────────────────────────────────────────────
+const contractsCache = new Map();
+let contractsCacheUpdatedAt = 0;
+const CONTRACTS_TTL = 5 * 60 * 1000; // 5 хвилин
+
+async function updateContractsCache() {
+  try {
+    const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts`, {
+      params: { limit: 1000 },
+      timeout: 10000,
+    });
+    contractsCache.clear();
+    for (const c of res.data) {
+      contractsCache.set(c.name, {
+        markPrice: parseFloat(c.mark_price),
+        quanto: parseFloat(c.quanto_multiplier || '1'),
+      });
+    }
+    contractsCacheUpdatedAt = Date.now();
+    log('INFO', `Contracts cache updated: ${contractsCache.size} contracts`);
+  } catch(e) {
+    log('ERROR', `Contracts cache update failed: ${e.message}`);
+  }
+}
+
 async function contractExists(ticker) {
   const contract = `${ticker}_USDT`;
-  try {
-    const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts/${contract}`, { timeout: 5000 });
-    return {
-      exists: true, contract,
-      markPrice: parseFloat(res.data.mark_price),
-      quanto: parseFloat(res.data.quanto_multiplier || '1'),
-    };
+
+  // Оновлюємо кеш якщо застарів
+  if (Date.now() - contractsCacheUpdatedAt > CONTRACTS_TTL) {
+    await updateContractsCache();
+  }
+
+  // Перевіряємо кеш (~0ms)
+  if (contractsCache.has(contract)) {
+    const data = contractsCache.get(contract);
+    // Отримуємо актуальну ціну
+    try {
+      const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts/${contract}`, { timeout: 3000 });
+      return {
+        exists: true, contract,
+        markPrice: parseFloat(res.data.mark_price),
+        quanto: parseFloat(res.data.quanto_multiplier || '1'),
+      };
+    } catch(e) {
+      return { exists: true, contract, markPrice: data.markPrice, quanto: data.quanto };
+    }
+  }
+
+  return { exists: false, contract };
+}
   } catch (e) {
     if (e.response?.status === 404) return { exists: false, contract };
     throw e;
@@ -372,6 +414,10 @@ async function main() {
     'WebSocket: tokyo.coinlisting.pro\n' +
     `Плече: ${CONFIG.LEVERAGE}x`
   );
+
+  // Завантажуємо кеш контрактів
+  await updateContractsCache();
+  setInterval(updateContractsCache, CONTRACTS_TTL);
 
   // WebSocket — основний канал
   startCoinListingWS();
