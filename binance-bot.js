@@ -184,7 +184,7 @@ async function openPosition(ticker, marginPercent, seenAt) {
   cachedBalance = null;
 
   sendTelegram(
-    `🟢 ПОЗИЦІЯ ВІДКРИТА\n` +
+    `ПОЗИЦІЯ ВІДКРИТА 🟢\n` +
     `─────────────────────\n` +
     `📌 Монета:     ${ticker}\n` +
     `🔗 Джерело:    BINANCE\n` +
@@ -256,8 +256,10 @@ async function tick() {
   if (isRunning) return;
   isRunning = true;
   try {
+    const agent = CONFIG.TELEGRAM_PROXY ? new SocksProxyAgent(CONFIG.TELEGRAM_PROXY) : undefined;
     const res = await axios.get(CONFIG.BINANCE_ANNOUNCE_URL, {
       headers: { 'User-Agent': 'Mozilla/5.0' },
+      httpsAgent: agent,
       timeout: 10000,
     });
 
@@ -305,20 +307,78 @@ async function tick() {
   }
 }
 
+// ─── CoinListing WebSocket (Binance Spot + Futures) ──────────────────────────
+function startCoinListingWS() {
+  const ws = new (require('ws'))('wss://tokyo.coinlisting.pro/listings?key=ilyak-2c3dbb');
+
+  ws.on('open', () => {
+    log('INFO', '[CoinListing] Connected to tokyo.coinlisting.pro');
+  });
+
+  ws.on('message', async (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === 'connection') {
+        log('INFO', `[CoinListing] Auth OK | tier=${msg.tier} | sources=${msg.sources?.join(',')}`);
+        return;
+      }
+
+      log('INFO', `[CoinListing] MSG: ${JSON.stringify(msg)}`);
+
+      // Фільтруємо тільки Binance лістинги (не делістинги)
+      if (!msg.source || !msg.source.includes('BINANCE')) return;
+      if (!msg.coins || msg.coins.length === 0) return;
+
+      const title = msg.title || '';
+      const titleLower = title.toLowerCase();
+
+      // Пропускаємо делістинги і технічні
+      if (SKIP_WORDS.some(w => titleLower.includes(w))) {
+        log('INFO', `[CoinListing] Skip: ${title}`);
+        return;
+      }
+
+      const seenAt = Date.now();
+      const validTickers = msg.coins.filter(t => t && t !== '***');
+
+      if (validTickers.length === 0) return;
+
+      log('INFO', `[CoinListing] BINANCE LISTING: ${validTickers.join(', ')} | ${title}`);
+      await handleListing(validTickers, seenAt);
+
+    } catch(e) {
+      log('ERROR', `[CoinListing] Parse error: ${e.message}`);
+    }
+  });
+
+  ws.on('error', (e) => {
+    log('ERROR', `[CoinListing] Error: ${e.message}`);
+  });
+
+  ws.on('close', (code) => {
+    log('WARN', `[CoinListing] Disconnected: ${code} — reconnecting in 3s...`);
+    setTimeout(startCoinListingWS, 3000);
+  });
+}
+
 async function main() {
   log('INFO', '══════════════════════════════════════');
-  log('INFO', ' Binance Announce Bot v2 — starting up');
+  log('INFO', ' Binance Announce Bot v3 — starting up');
   log('INFO', '══════════════════════════════════════');
-  log('INFO', `LEV=${CONFIG.LEVERAGE}x | Optimized: cache+async+parallel`);
+  log('INFO', `LEV=${CONFIG.LEVERAGE}x | WebSocket + HTTP fallback`);
 
   sendTelegram(
-    'Binance Announce Bot v2 запущен\n' +
-    'Оптимізації: кеш балансу + async TG + паралельні запити\n' +
+    'Binance Listing Bot v3 запущен\n' +
+    'WebSocket: tokyo.coinlisting.pro\n' +
     `Плече: ${CONFIG.LEVERAGE}x`
   );
 
+  // WebSocket — основний канал
+  startCoinListingWS();
+
+  // HTTP fallback — резерв кожні 30 сек
   await tick();
-  setInterval(tick, CONFIG.POLL_INTERVAL_MS);
+  setInterval(tick, 30000);
 }
 
 process.on('uncaughtException', (e) => {
