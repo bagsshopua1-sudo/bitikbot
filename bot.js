@@ -33,6 +33,48 @@ const knownCoins = new Map();
 let initialized = false;
 const processedTickers = new Map();
 const TICKER_TTL_MS = 24 * 60 * 60 * 1000;
+const STATE_FILE = path.join(__dirname, 'upbit-state.json');
+
+// Завантажити стан з диску
+function loadState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+      const now = Date.now();
+      // Відновлюємо відомі монети
+      if (data.knownCoins) {
+        data.knownCoins.forEach(code => knownCoins.set(code, true));
+        log('INFO', `State loaded: ${knownCoins.size} known coins from disk`);
+      }
+      // Відновлюємо оброблені тікери (тільки свіжі)
+      if (data.processedTickers) {
+        data.processedTickers.forEach(([ticker, ts]) => {
+          if (now - ts < TICKER_TTL_MS) processedTickers.set(ticker, ts);
+        });
+      }
+      initialized = knownCoins.size > 0;
+    }
+  } catch(e) {
+    log('WARN', `Could not load state: ${e.message}`);
+  }
+}
+
+// Зберегти стан на диск
+function saveState() {
+  try {
+    const data = {
+      knownCoins: [...knownCoins.keys()],
+      processedTickers: [...processedTickers.entries()],
+      savedAt: Date.now(),
+    };
+    fs.writeFileSync(STATE_FILE, JSON.stringify(data));
+  } catch(e) {
+    log('WARN', `Could not save state: ${e.message}`);
+  }
+}
+
+// Зберігати стан кожні 30 сек
+setInterval(saveState, 30000);
 
 // ─── Кеш балансу (оптимізація 1) ─────────────────────────────────────────────
 let cachedBalance = null;
@@ -187,7 +229,7 @@ async function handleNewListing(ticker, seenAt) {
   cachedBalance = null;
 
   sendTelegram(
-    `🟢 ПОЗИЦІЯ ВІДКРИТА\n` +
+    `ПОЗИЦІЯ ВІДКРИТА 🟢\n` +
     `─────────────────────\n` +
     `📌 Монета:     ${ticker}\n` +
     `🔗 Джерело:    UPBIT\n` +
@@ -223,6 +265,7 @@ async function tick() {
       }
       log('INFO', `Initialized with ${knownCoins.size} coins from Upbit`);
       initialized = true;
+      saveState();
       return;
     }
 
@@ -248,6 +291,9 @@ async function main() {
   log('INFO', ' Upbit Listing Bot v3 — starting up');
   log('INFO', '══════════════════════════════════════');
   log('INFO', `LEV=${CONFIG.LEVERAGE}x | Optimized: cache+async+parallel`);
+
+  // Завантажуємо збережений стан
+  loadState();
 
   sendTelegram(
     'Upbit Listing Bot v3 запущен\n' +
