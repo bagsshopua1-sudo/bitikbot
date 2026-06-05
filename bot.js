@@ -344,11 +344,17 @@ function startCoinListingWS() {
         log('INFO', `[CoinListing] Auth OK | tier=${msg.tier} | delay=${msg.delay_ms}ms`);
         return;
       }
-      if (msg.type === 'listing' || msg.ticker || msg.symbol) {
-        const ticker = msg.ticker || msg.symbol || msg.coin;
-        log('INFO', `[CoinListing] NEW LISTING: ${JSON.stringify(msg)}`);
-        if (ticker && ticker !== '***') {
-          await handleNewListing(ticker.replace('_USDT','').replace('/USDT',''), Date.now());
+      
+      log('INFO', `[CoinListing] MSG: ${JSON.stringify(msg)}`);
+      
+      // Формат: { source, title, coins: ["BABY"], detected_at_iso }
+      if (msg.source === 'UPBIT' && msg.coins && msg.coins.length > 0) {
+        const seenAt = Date.now();
+        for (const ticker of msg.coins) {
+          if (ticker && ticker !== '***') {
+            log('INFO', `[CoinListing] UPBIT LISTING: ${ticker}`);
+            await handleNewListing(ticker, seenAt);
+          }
         }
       }
     } catch(e) {
