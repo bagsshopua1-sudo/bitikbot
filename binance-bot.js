@@ -155,11 +155,6 @@ async function contractExists(ticker) {
 
   return { exists: false, contract };
 }
-  } catch (e) {
-    if (e.response?.status === 404) return { exists: false, contract };
-    throw e;
-  }
-}
 
 async function openOrderWithRetry(contract, size) {
   for (let attempt = 1; attempt <= CONFIG.ORDER_RETRIES; attempt++) {
