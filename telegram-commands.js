@@ -172,21 +172,17 @@ async function cmdSl(contract, price, chatId) {
 }
 
 async function cmdClose(contract, chatId) {
-  const pos = await gateRequest('GET', `/futures/usdt/positions/${contract}`, null, null);
-  
-  // В dual mode size може бути 0 але trade_long_size показує реальний розмір
-  const longSize = parseInt(pos.trade_long_size || 0);
-  const shortSize = parseInt(pos.trade_short_size || 0);
-  const size = parseInt(pos.size);
-  
-  const realSize = size !== 0 ? size : (longSize > 0 ? longSize : -shortSize);
-  
-  if (realSize === 0) {
-    await sendTelegram(`❌ Немає позиції по ${contract}`, chatId);
+  // Отримуємо всі відкриті ордери щоб знайти розмір
+  const positions = await gateRequest('GET', '/futures/usdt/positions', null, null);
+  const pos = positions.find(p => p.contract === contract && parseInt(p.size) !== 0);
+
+  if (!pos) {
+    await sendTelegram(`❌ Немає відкритої позиції по ${contract}`, chatId);
     return;
   }
 
-  const closeSize = realSize > 0 ? -Math.abs(realSize) : Math.abs(realSize);
+  const size = parseInt(pos.size);
+  const closeSize = size > 0 ? -Math.abs(size) : Math.abs(size);
 
   await gateRequest('POST', '/futures/usdt/orders', null, {
     contract,
@@ -197,8 +193,8 @@ async function cmdClose(contract, chatId) {
   });
 
   const entryPrice = parseFloat(pos.entry_price);
-  const markPrice  = parseFloat(pos.mark_price);
-  const pnl = ((markPrice - entryPrice) * size).toFixed(2);
+  const markPrice = parseFloat(pos.mark_price);
+  const pnl = ((markPrice - entryPrice) * Math.abs(size)).toFixed(2);
   const pnlEmoji = parseFloat(pnl) >= 0 ? '🟢' : '🔴';
 
   await sendTelegram(
