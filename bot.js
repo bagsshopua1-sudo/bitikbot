@@ -222,10 +222,12 @@ async function handleNewListing(ticker, seenAt) {
   log('INFO', `NEW LISTING [Upbit]: ${ticker}`);
 
   // Оптимізація 4: паралельно перевіряємо контракт і баланс
-  const [contractData, available] = await Promise.all([
+  const [contractData, freshAccount] = await Promise.all([
     contractExists(ticker),
-    getCachedBalance(),
+    gateRequest('GET', '/futures/usdt/accounts', null, null),
   ]);
+
+  const available = parseFloat(freshAccount.available);
 
   if (!contractData.exists) {
     log('WARN', `No Gate.io contract for ${ticker}`);
@@ -240,7 +242,7 @@ async function handleNewListing(ticker, seenAt) {
     { leverage: '0', cross_leverage_limit: String(CONFIG.LEVERAGE) }, null
   ).catch(e => log('WARN', `Leverage: ${e.response?.data?.message || e.message}`));
 
-  const useMargin = available * 0.9;
+  const useMargin = available * 0.8;
   const size = Math.max(1, Math.floor((useMargin * CONFIG.LEVERAGE) / (markPrice * quanto)));
   const posValue = (size * markPrice * quanto).toFixed(2);
 
@@ -281,7 +283,7 @@ async function handleNewListing(ticker, seenAt) {
 const seenNoticeIds = new Set();
 let noticesInitialized = false;
 
-const LISTING_KEYWORDS = ['추가', '신규 상장', '거래 지원', '디지털 자산 추가'];
+const LISTING_KEYWORDS = ['추가', '신규 상장', '거래 지원', '디지털 자산 추가', '신규 거래지원', '거래지원 안내'];
 const SKIP_KEYWORDS = ['입출금', '점검', '이벤트', '중단', '종료', '폐지', '유의'];
 
 function extractTickerFromTitle(title) {
