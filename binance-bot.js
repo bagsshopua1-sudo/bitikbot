@@ -182,11 +182,13 @@ async function openPosition(ticker, marginPercent, seenAt) {
 
   log('INFO', `Opening [Binance]: ${ticker} (${marginPercent}% margin)`);
 
-  // Оптимізація 4: паралельно перевіряємо контракт і баланс
-  const [contractData, available] = await Promise.all([
+  // Завжди беремо свіжий баланс
+  const [contractData, freshAccount] = await Promise.all([
     contractExists(ticker),
-    getCachedBalance(),
+    gateRequest('GET', '/futures/usdt/accounts', null, null),
   ]);
+
+  const available = parseFloat(freshAccount.available);
 
   if (!contractData.exists) {
     log('WARN', `No Gate.io contract for ${ticker}`);
@@ -251,10 +253,10 @@ async function handleListing(tickers, seenAt) {
   // Розподіл балансу
   let marginPerTicker;
   if (available.length === 0) return;
-  if (tickers.length === 1) marginPerTicker = 90;
-  else if (tickers.length === 2 && available.length === 1) marginPerTicker = 90;
-  else if (tickers.length === 2) marginPerTicker = 40;
-  else marginPerTicker = Math.floor(80 / available.length);
+  if (tickers.length === 1) marginPerTicker = 80;
+  else if (tickers.length === 2 && available.length === 1) marginPerTicker = 80;
+  else if (tickers.length === 2) marginPerTicker = 38;
+  else marginPerTicker = Math.floor(75 / available.length);
 
   // Оптимізація 4: відкриваємо всі позиції ПАРАЛЕЛЬНО
   await Promise.all(available.map(ticker => openPosition(ticker, marginPerTicker, seenAt)));
