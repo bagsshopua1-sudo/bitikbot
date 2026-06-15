@@ -1,8 +1,8 @@
 require('dotenv').config();
-const axios  = require('axios');
-const crypto = require('crypto');
-const fs     = require('fs');
-const path   = require('path');
+const axios     = require('axios');
+const crypto    = require('crypto');
+const fs        = require('fs');
+const path      = require('path');
 const WebSocket = require('ws');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 
@@ -17,18 +17,18 @@ function log(level, message) {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const CONFIG = {
-  GATE_API_KEY:    process.env.GATE_API_KEY    || '',
-  GATE_API_SECRET: process.env.GATE_API_SECRET || '',
-  TELEGRAM_TOKEN:  process.env.TELEGRAM_TOKEN  || '',
-  TELEGRAM_CHAT_ID:process.env.TELEGRAM_CHAT_ID|| '',
-  TELEGRAM_PROXY:  process.env.TELEGRAM_PROXY  || '',
-  LEVERAGE:        parseInt(process.env.LEVERAGE || '10'),
-  POLL_INTERVAL_MS:2000,
-  GATE_BASE:       'https://api.gateio.ws/api/v4',
-  GATE_WS_URL:     'wss://fx-ws.gateio.ws/v4/ws/usdt',
-  COINLISTING_URL: 'wss://seoul.coinlisting.pro/listings?key=ilyak-2c3dbb',
-  UPBIT_CRIX_URL:  'https://crix-static.upbit.com/v2/crix_master',
-  ORDER_TIMEOUT_MS: 5000,  // чекаємо відповідь від WS ордера
+  GATE_API_KEY:     process.env.GATE_API_KEY     || '',
+  GATE_API_SECRET:  process.env.GATE_API_SECRET  || '',
+  TELEGRAM_TOKEN:   process.env.TELEGRAM_TOKEN   || '',
+  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
+  TELEGRAM_PROXY:   process.env.TELEGRAM_PROXY   || '',
+  LEVERAGE:         parseInt(process.env.LEVERAGE || '10'),
+  POLL_INTERVAL_MS: 2000,
+  GATE_BASE:        'https://api.gateio.ws/api/v4',
+  GATE_WS_URL:      'wss://fx-ws.gateio.ws/v4/ws/usdt',
+  COINLISTING_URL:  'wss://seoul.coinlisting.pro/listings?key=ilyak-2c3dbb',
+  UPBIT_CRIX_URL:   'https://crix-static.upbit.com/v2/crix_master',
+  ORDER_TIMEOUT_MS: 5000,
 };
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -40,7 +40,6 @@ let initialized        = false;
 let lastChecksum       = null;
 let isRunning          = false;
 
-// ─── State persistence ────────────────────────────────────────────────────────
 function loadState() {
   try {
     if (!fs.existsSync(STATE_FILE)) return;
@@ -64,9 +63,7 @@ function saveState() {
       processedTickers: [...processedTickers.entries()],
       savedAt: Date.now(),
     }));
-  } catch(e) {
-    log('WARN', `State save failed: ${e.message}`);
-  }
+  } catch(e) {}
 }
 
 setInterval(saveState, 30000);
@@ -89,7 +86,7 @@ function sendTelegram(text) {
    .catch(e => log('ERROR', `Telegram: ${e.message}`));
 }
 
-// ─── REST signing ─────────────────────────────────────────────────────────────
+// ─── REST ─────────────────────────────────────────────────────────────────────
 function signRest(method, endpoint, query, body) {
   const ts       = Math.floor(Date.now() / 1000).toString();
   const fullPath = '/api/v4' + endpoint;
@@ -115,7 +112,7 @@ async function gateRest(method, endpoint, query, data) {
 }
 
 // ─── Contracts cache ──────────────────────────────────────────────────────────
-const contractsCache       = new Map();
+const contractsCache        = new Map();
 let contractsCacheUpdatedAt = 0;
 const CONTRACTS_TTL         = 5 * 60 * 1000;
 
@@ -136,16 +133,9 @@ async function updateContractsCache() {
   }
 }
 
-function getContractInfo(ticker) {
-  const contract = `${ticker}_USDT`;
-  if (!contractsCache.has(contract)) return null;
-  return { contract, ...contractsCache.get(contract) };
-}
-
-// ─── Balance cache ────────────────────────────────────────────────────────────
-let cachedBalance     = null;
-let balanceUpdatedAt  = 0;
-const BALANCE_TTL_MS  = 5000;
+// ─── Balance ──────────────────────────────────────────────────────────────────
+let cachedBalance    = null;
+let balanceUpdatedAt = 0;
 
 async function getFreshBalance() {
   const acc     = await gateRest('GET', '/futures/usdt/accounts', null, null);
@@ -154,21 +144,27 @@ async function getFreshBalance() {
   return cachedBalance;
 }
 
-setInterval(async () => {
-  try { await getFreshBalance(); } catch(e) {}
-}, BALANCE_TTL_MS);
+setInterval(async () => { try { await getFreshBalance(); } catch(e) {} }, 5000);
+
+// ─── Gate.io WebSocket підпис ─────────────────────────────────────────────────
+function signWs(channel, event, ts) {
+  const str = `channel=${channel}&event=${event}&time=${ts}`;
+  return crypto.createHmac('sha512', CONFIG.GATE_API_SECRET).update(str).digest('hex');
+}
+
+function makeAuth(channel, event, ts) {
+  return {
+    method: 'api_key',
+    KEY:    CONFIG.GATE_API_KEY,
+    SIGN:   signWs(channel, event, ts),
+  };
+}
 
 // ─── Gate.io WebSocket для ордерів ────────────────────────────────────────────
 let gateWs          = null;
 let gateWsReady     = false;
 let gateWsReqId     = 1;
-const gateWsPending = new Map(); // reqId → { resolve, reject, timer }
-
-function signWs(ts) {
-  return crypto.createHmac('sha512', CONFIG.GATE_API_SECRET)
-    .update(`api\n${ts}`)
-    .digest('hex');
-}
+const gateWsPending = new Map();
 
 function connectGateWs() {
   log('INFO', '[GateWS] Connecting...');
@@ -176,19 +172,16 @@ function connectGateWs() {
   gateWsReady = false;
 
   gateWs.on('open', () => {
-    log('INFO', '[GateWS] Connected — authenticating...');
-    const ts  = Math.floor(Date.now() / 1000);
-    const sig = signWs(ts);
+    log('INFO', '[GateWS] Connected — subscribing to order channel...');
+    const ts = Math.floor(Date.now() / 1000);
+
+    // Підписуємось на канал ордерів (це також авторизовує нас)
     gateWs.send(JSON.stringify({
-      time:       ts,
-      channel:    'futures.login',
-      event:      'api',
-      request_id: 'auth-' + ts,
-      payload: {
-        api_key:   CONFIG.GATE_API_KEY,
-        signature: sig,
-        timestamp: String(ts),
-      },
+      time:    ts,
+      channel: 'futures.orders',
+      event:   'subscribe',
+      payload: ['!all'],
+      auth:    makeAuth('futures.orders', 'subscribe', ts),
     }));
   });
 
@@ -196,29 +189,29 @@ function connectGateWs() {
     try {
       const msg = JSON.parse(raw.toString());
 
-      // Auth response
-      if (msg.channel === 'futures.login') {
-        if (msg.event === 'api' && msg.result?.status === 'success') {
+      // Підписка на ордери — авторизація успішна
+      if (msg.channel === 'futures.orders' && msg.event === 'subscribe') {
+        if (msg.result?.status === 'success') {
           gateWsReady = true;
-          log('INFO', '[GateWS] Authenticated! Ready for WS orders.');
+          log('INFO', '[GateWS] Authenticated & subscribed! Ready for WS orders.');
         } else {
-          log('ERROR', `[GateWS] Auth failed: ${JSON.stringify(msg)}`);
+          log('ERROR', `[GateWS] Subscribe failed: ${JSON.stringify(msg)}`);
         }
         return;
       }
 
-      // Order response
+      // Відповідь на розміщення ордера
       if (msg.channel === 'futures.order_place') {
-        const reqId = msg.request_id || msg.id;
+        const reqId = msg.request_id;
         const pend  = gateWsPending.get(reqId);
         if (!pend) return;
         clearTimeout(pend.timer);
         gateWsPending.delete(reqId);
 
-        if (msg.errs || (msg.result && msg.result.errs)) {
-          pend.reject(new Error(JSON.stringify(msg.errs || msg.result?.errs)));
+        if (msg.data?.errs || msg.errs) {
+          pend.reject(new Error(JSON.stringify(msg.data?.errs || msg.errs)));
         } else {
-          pend.resolve(msg.result || msg);
+          pend.resolve(msg.data || msg.result || msg);
         }
       }
     } catch(e) {
@@ -234,7 +227,6 @@ function connectGateWs() {
   gateWs.on('close', (code) => {
     log('WARN', `[GateWS] Closed: ${code} — reconnecting in 2s...`);
     gateWsReady = false;
-    // Відхиляємо всі pending запити
     for (const [id, pend] of gateWsPending.entries()) {
       clearTimeout(pend.timer);
       pend.reject(new Error('WS disconnected'));
@@ -243,9 +235,9 @@ function connectGateWs() {
     setTimeout(connectGateWs, 2000);
   });
 
-  // Ping кожні 20 сек щоб з'єднання не закривалось
+  // Ping кожні 20 сек
   const pingInterval = setInterval(() => {
-    if (gateWs.readyState === WebSocket.OPEN) {
+    if (gateWs && gateWs.readyState === WebSocket.OPEN) {
       gateWs.send(JSON.stringify({ time: Math.floor(Date.now()/1000), channel: 'futures.ping' }));
     } else {
       clearInterval(pingInterval);
@@ -260,15 +252,8 @@ function placeOrderWs(contract, size) {
       return reject(new Error('GateWS not ready'));
     }
 
-    const reqId = String(gateWsReqId++);
-    const ts    = Math.floor(Date.now() / 1000);
-    const payload = {
-      contract,
-      size,
-      price:  '0',
-      tif:    'ioc',
-      text:   't-listing-ws',
-    };
+    const reqId   = String(gateWsReqId++);
+    const ts      = Math.floor(Date.now() / 1000);
 
     const timer = setTimeout(() => {
       gateWsPending.delete(reqId);
@@ -282,25 +267,30 @@ function placeOrderWs(contract, size) {
       channel:    'futures.order_place',
       event:      'api',
       request_id: reqId,
-      payload,
+      payload: {
+        contract,
+        size,
+        price:  '0',
+        tif:    'ioc',
+        text:   't-listing-ws',
+      },
+      auth: makeAuth('futures.order_place', 'api', ts),
     }));
   });
 }
 
-// ─── Open order: WS першочергово, REST як fallback ────────────────────────────
+// ─── Відкриття ордера: WS → REST fallback ────────────────────────────────────
 async function openOrder(contract, size) {
-  // Спробуємо через WS
   if (gateWsReady) {
     try {
       const result = await placeOrderWs(contract, size);
       log('INFO', `[WS Order] Opened via WebSocket`);
       return result;
     } catch(e) {
-      log('WARN', `[WS Order] Failed, falling back to REST: ${e.message}`);
+      log('WARN', `[WS Order] Failed: ${e.message} — falling back to REST`);
     }
   }
 
-  // Fallback: REST з retry
   for (let attempt = 1; attempt <= 30; attempt++) {
     try {
       const order = await gateRest('POST', '/futures/usdt/orders', null, {
@@ -324,50 +314,48 @@ async function handleNewListing(ticker, seenAt) {
 
   log('INFO', `NEW LISTING [Upbit WS]: ${ticker}`);
 
-  // Паралельно: контракт з кешу + свіжий баланс
-  let contractInfo = getContractInfo(ticker);
+  // Контракт з кешу або REST
+  const contract = `${ticker}_USDT`;
+  let markPrice, quanto;
 
-  // Якщо немає в кеші — пробуємо REST
-  if (!contractInfo) {
+  if (contractsCache.has(contract)) {
+    const cached = contractsCache.get(contract);
+    // Отримуємо актуальну ціну
     try {
-      const res      = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts/${ticker}_USDT`, { timeout: 3000 });
-      contractInfo   = {
-        contract:  `${ticker}_USDT`,
-        markPrice: parseFloat(res.data.mark_price),
-        quanto:    parseFloat(res.data.quanto_multiplier || '1'),
-      };
-      // Додаємо в кеш
-      contractsCache.set(`${ticker}_USDT`, { markPrice: contractInfo.markPrice, quanto: contractInfo.quanto });
+      const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts/${contract}`, { timeout: 3000 });
+      markPrice = parseFloat(res.data.mark_price);
+      quanto    = parseFloat(res.data.quanto_multiplier || '1');
+    } catch(e) {
+      markPrice = cached.markPrice;
+      quanto    = cached.quanto;
+    }
+  } else {
+    try {
+      const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts/${contract}`, { timeout: 3000 });
+      markPrice = parseFloat(res.data.mark_price);
+      quanto    = parseFloat(res.data.quanto_multiplier || '1');
+      contractsCache.set(contract, { markPrice, quanto });
     } catch(e) {
       log('WARN', `No contract for ${ticker}: ${e.message}`);
       sendTelegram(`[Upbit WS] Немає контракту для ${ticker} на Gate.io`);
       return;
     }
-  } else {
-    // Оновлюємо актуальну ціну з REST (швидко, контракт відомий)
-    try {
-      const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts/${ticker}_USDT`, { timeout: 3000 });
-      contractInfo.markPrice = parseFloat(res.data.mark_price);
-      contractInfo.quanto    = parseFloat(res.data.quanto_multiplier || '1');
-    } catch(e) { /* використовуємо кешовану ціну */ }
   }
-
-  const { contract, markPrice, quanto } = contractInfo;
 
   // Свіжий баланс
   const available = await getFreshBalance();
 
-  // Встановлення плеча (не чекаємо)
+  // Плече (не чекаємо)
   gateRest('POST', `/futures/usdt/positions/${contract}/leverage`,
     { leverage: '0', cross_leverage_limit: String(CONFIG.LEVERAGE) }, null
   ).catch(e => log('WARN', `Leverage: ${e.response?.data?.message || e.message}`));
 
-  // Розрахунок розміру (65% балансу з урахуванням буфера Gate.io)
+  // Розрахунок розміру (65% балансу)
   const targetMargin = available * 0.65;
   const size         = Math.max(1, Math.floor((targetMargin * CONFIG.LEVERAGE) / (markPrice * quanto)));
   const posValue     = (size * markPrice * quanto).toFixed(2);
 
-  log('INFO', `Opening [WS]: ${contract} size=${size} price=${markPrice} quanto=${quanto} value=$${posValue} available=${available}`);
+  log('INFO', `Opening: ${contract} size=${size} price=${markPrice} quanto=${quanto} value=$${posValue}`);
 
   let order;
   try {
@@ -375,16 +363,15 @@ async function handleNewListing(ticker, seenAt) {
   } catch(e) {
     log('ERROR', `Order failed: ${e.response?.data?.message || e.message}`);
     sendTelegram(`ПОМИЛКА [Upbit WS] ${contract}:\n${e.response?.data?.message || e.message}`);
-    // Скидаємо processedTickers щоб можна було спробувати знову
     processedTickers.delete(ticker);
     return;
   }
 
-  const entryPrice = parseFloat(order.fill_price || order?.result?.fill_price) || markPrice;
+  const entryPrice = parseFloat(order.fill_price) || markPrice;
   const elapsedSec = ((Date.now() - seenAt) / 1000).toFixed(2);
-  const method     = order.text?.includes('ws') || !order.fill_price ? 'WS' : 'REST';
+  const method     = gateWsReady ? 'WS' : 'REST';
 
-  cachedBalance = null; // скидаємо кеш балансу
+  cachedBalance = null;
 
   sendTelegram(
     `ПОЗИЦІЯ ВІДКРИТА 🟢\n` +
@@ -403,8 +390,8 @@ async function handleNewListing(ticker, seenAt) {
   log('INFO', `Opened ${contract} entry=${entryPrice} method=${method} speed=${elapsedSec}s`);
 }
 
-// ─── Upbit анонси (резерв через проксі) ──────────────────────────────────────
-const seenNoticeIds  = new Set();
+// ─── Upbit Notices (резерв) ───────────────────────────────────────────────────
+const seenNoticeIds    = new Set();
 let noticesInitialized = false;
 let noticeRunning      = false;
 
@@ -412,8 +399,7 @@ const LISTING_KEYWORDS = ['추가', '신규 상장', '거래 지원', '디지털
 const SKIP_KEYWORDS    = ['입출금', '점검', '이벤트', '중단', '종료', '폐지', '유의'];
 
 function extractTickerFromTitle(title) {
-  const matches = title.match(/\(([A-Z]{2,10})\)/g) || [];
-  return matches.map(m => m.replace(/[()]/g, ''));
+  return (title.match(/\(([A-Z]{2,10})\)/g) || []).map(m => m.replace(/[()]/g, ''));
 }
 
 async function tickNotices() {
@@ -435,7 +421,6 @@ async function tickNotices() {
         timeout: 10000,
       }
     );
-
     const notices = res.data?.data?.notices || [];
     const seenAt  = Date.now();
 
@@ -449,26 +434,16 @@ async function tickNotices() {
     for (const notice of notices) {
       if (seenNoticeIds.has(notice.id)) continue;
       seenNoticeIds.add(notice.id);
-
       const title = notice.title || '';
-      log('INFO', `[Notice] New: ${title}`);
-
       if (SKIP_KEYWORDS.some(w => title.includes(w))) continue;
       if (!LISTING_KEYWORDS.some(w => title.includes(w))) {
         sendTelegram(`🟡 Upbit анонс (перевір):\n${title}`);
         continue;
       }
-
       const tickers = extractTickerFromTitle(title);
-      if (tickers.length === 0) {
-        sendTelegram(`🟡 Upbit лістинг без тікера:\n${title}`);
-        continue;
-      }
-
+      if (!tickers.length) { sendTelegram(`🟡 Upbit лістинг без тікера:\n${title}`); continue; }
       log('INFO', `[Notice] LISTING: ${tickers.join(', ')}`);
-      for (const ticker of tickers) {
-        await handleNewListing(ticker, seenAt);
-      }
+      for (const ticker of tickers) await handleNewListing(ticker, seenAt);
     }
   } catch(e) {
     log('ERROR', `[Notices] Tick: ${e.message}`);
@@ -477,12 +452,10 @@ async function tickNotices() {
   }
 }
 
-// ─── CoinListing WebSocket (сигнали Upbit) ────────────────────────────────────
+// ─── CoinListing WebSocket ────────────────────────────────────────────────────
 function startCoinListingWS() {
   const ws = new WebSocket(CONFIG.COINLISTING_URL);
-
   ws.on('open', () => log('INFO', '[CoinListing] Connected to seoul.coinlisting.pro'));
-
   ws.on('message', async (data) => {
     try {
       const msg = JSON.parse(data.toString());
@@ -490,7 +463,6 @@ function startCoinListingWS() {
         log('INFO', `[CoinListing] Auth OK | tier=${msg.tier} | delay=${msg.delay_ms}ms`);
         return;
       }
-      log('INFO', `[CoinListing] MSG: ${JSON.stringify(msg)}`);
       if (msg.source === 'UPBIT' && msg.coins?.length > 0) {
         const seenAt = Date.now();
         for (const ticker of msg.coins) {
@@ -500,16 +472,11 @@ function startCoinListingWS() {
           }
         }
       }
-    } catch(e) {
-      log('ERROR', `[CoinListing] Parse: ${e.message}`);
-    }
+    } catch(e) { log('ERROR', `[CoinListing] Parse: ${e.message}`); }
   });
-
   ws.on('error', e => log('ERROR', `[CoinListing] Error: ${e.message}`));
-
   ws.on('close', (code) => {
     log('WARN', `[CoinListing] Disconnected: ${code} — reconnecting in 3s...`);
-    sendTelegram('⚠️ CoinListing WS відключився! Перепідключаємось...');
     setTimeout(startCoinListingWS, 3000);
   });
 }
@@ -519,9 +486,8 @@ async function tick() {
   if (isRunning) return;
   isRunning = true;
   try {
-    const tsRes  = await axios.get('https://crix-static.upbit.com/v2/crix_master_timestamp', {
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Origin': 'https://upbit.com' },
-      timeout: 5000,
+    const tsRes = await axios.get('https://crix-static.upbit.com/v2/crix_master_timestamp', {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Origin': 'https://upbit.com' }, timeout: 5000,
     });
     const checksum = tsRes.data?.checksum;
     if (lastChecksum && lastChecksum === checksum) { isRunning = false; return; }
@@ -548,9 +514,7 @@ async function tick() {
 
     for (const coin of coins) {
       const code = coin.baseCurrencyCode || coin.code;
-      if (!code) continue;
-      if (coin.quoteCurrencyCode !== 'KRW') continue;
-      if (coin.marketState !== 'ACTIVE') continue;
+      if (!code || coin.quoteCurrencyCode !== 'KRW' || coin.marketState !== 'ACTIVE') continue;
       if (!knownCoins.has(coin.code || code)) {
         knownCoins.set(coin.code || code, coin);
         await handleNewListing(code, seenAt);
@@ -566,42 +530,33 @@ async function tick() {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   log('INFO', '══════════════════════════════════════════');
-  log('INFO', ' Upbit Listing Bot WS — starting up');
+  log('INFO', ' Upbit Listing Bot WS v2 — starting up');
   log('INFO', '══════════════════════════════════════════');
   log('INFO', `LEV=${CONFIG.LEVERAGE}x | Gate.io WebSocket orders`);
 
   loadState();
 
   sendTelegram(
-    'Upbit WS Bot запущен\n' +
-    'Gate.io WebSocket ордери\n' +
+    'Upbit WS Bot v2 запущен\n' +
+    'Gate.io WebSocket ордери активовані\n' +
     `Плече: ${CONFIG.LEVERAGE}x`
   );
 
-  // 1. Кеш контрактів
   await updateContractsCache();
   setInterval(updateContractsCache, CONTRACTS_TTL);
 
-  // 2. Баланс
   await getFreshBalance();
-
-  // 3. Gate.io WebSocket для ордерів
   connectGateWs();
-
-  // 4. CoinListing WebSocket (сигнали)
   startCoinListingWS();
 
-  // 5. crix_master резерв
   await tick();
   setInterval(tick, CONFIG.POLL_INTERVAL_MS);
 
-  // 6. Notices резерв
   await tickNotices();
   setInterval(tickNotices, 60000);
 
-  // 7. Heartbeat
   setInterval(() => {
-    const wsStatus = gateWsReady ? 'ready' : 'not ready';
+    const wsStatus = gateWsReady ? 'ready' : 'NOT READY';
     log('INFO', `Heartbeat | GateWS: ${wsStatus}`);
     sendTelegram(`✅ Upbit WS Bot живий\nGate.io WS: ${wsStatus}\n${new Date().toISOString()}`);
   }, 60 * 60 * 1000);
