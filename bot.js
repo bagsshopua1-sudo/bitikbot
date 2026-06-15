@@ -24,8 +24,8 @@ const CONFIG = {
   POLL_INTERVAL_MS: 2000,
   GATE_BASE:        'https://api.gateio.ws/api/v4',
   UPBIT_CRIX_URL:   'https://crix-static.upbit.com/v2/crix_master',
-  ORDER_RETRIES:    10,
-  ORDER_RETRY_MS:   300,
+  ORDER_RETRIES:    30,
+  ORDER_RETRY_MS:   1000,
 };
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -242,8 +242,13 @@ async function handleNewListing(ticker, seenAt) {
     { leverage: '0', cross_leverage_limit: String(CONFIG.LEVERAGE) }, null
   ).catch(e => log('WARN', `Leverage: ${e.response?.data?.message || e.message}`));
 
-  const useMargin = available * 0.8;
-  const size = Math.max(1, Math.floor((useMargin * CONFIG.LEVERAGE) / (markPrice * quanto)));
+  const useMargin = available * 0.7;
+  let size = Math.max(1, Math.floor((useMargin * CONFIG.LEVERAGE) / (markPrice * quanto)));
+  
+  // Перевіряємо що маржа не перевищує доступний баланс
+  while (size > 1 && (size * markPrice * quanto / CONFIG.LEVERAGE) > available * 0.75) {
+    size = Math.floor(size * 0.95);
+  }
   const posValue = (size * markPrice * quanto).toFixed(2);
 
   log('INFO', `Opening: ${contract} size=${size} price=${markPrice} value=$${posValue}`);
