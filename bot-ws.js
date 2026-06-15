@@ -180,9 +180,10 @@ function connectGateWs() {
     const ts  = Math.floor(Date.now() / 1000);
     const sig = signWs(ts);
     gateWs.send(JSON.stringify({
-      time:    ts,
-      channel: 'futures.login',
-      event:   'api',
+      time:       ts,
+      channel:    'futures.login',
+      event:      'api',
+      request_id: 'auth-' + ts,
       payload: {
         api_key:   CONFIG.GATE_API_KEY,
         signature: sig,
