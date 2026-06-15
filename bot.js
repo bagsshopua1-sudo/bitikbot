@@ -242,13 +242,12 @@ async function handleNewListing(ticker, seenAt) {
     { leverage: '0', cross_leverage_limit: String(CONFIG.LEVERAGE) }, null
   ).catch(e => log('WARN', `Leverage: ${e.response?.data?.message || e.message}`));
 
-  const useMargin = available * 0.7;
-  let size = Math.max(1, Math.floor((useMargin * CONFIG.LEVERAGE) / (markPrice * quanto)));
+  // Підбираємо розмір так щоб маржа точно влізала в 75% балансу
+  // Враховуємо що Gate.io додає ~15% буфер до маржі
+  const targetMargin = available * 0.65;
+  let size = Math.max(1, Math.floor((targetMargin * CONFIG.LEVERAGE) / (markPrice * quanto)));
   
-  // Перевіряємо що маржа не перевищує доступний баланс
-  while (size > 1 && (size * markPrice * quanto / CONFIG.LEVERAGE) > available * 0.75) {
-    size = Math.floor(size * 0.95);
-  }
+  log('INFO', `Size calc: available=${available} target_margin=${targetMargin.toFixed(2)} size=${size} est_margin=${(size*markPrice*quanto/CONFIG.LEVERAGE).toFixed(2)}`);
   const posValue = (size * markPrice * quanto).toFixed(2);
 
   log('INFO', `Opening: ${contract} size=${size} price=${markPrice} value=$${posValue}`);
