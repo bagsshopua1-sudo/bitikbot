@@ -190,20 +190,17 @@ async def main():
                 log('Login not confirmed, retrying...')
         log('Gate.io WS: Login confirmed!')
     
-    # Ping кожні 20 сек + перевірка логіну
+    # Моніторинг логіну кожну секунду
     async def ping_loop():
         while True:
-            await asyncio.sleep(20)
+            await asyncio.sleep(1)
             try:
-                if conn:
-                    log('Ping...')
-                # Якщо втратили логін — логінимось знову
                 if not logged_in:
-                    log('Lost login — re-logging in...')
+                    log('Not logged in — re-logging in...')
                     login_channel.login(header='', req_id=f'relogin-{int(time.time())}')
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(2)
             except Exception as e:
-                log(f'Ping error: {e}')
+                log(f'Login check error: {e}')
     
     await asyncio.gather(
         conn.run(),
