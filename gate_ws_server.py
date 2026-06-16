@@ -176,17 +176,13 @@ async def main():
     
     async def login_when_ready():
         await asyncio.sleep(1)
-        log('Logging in to Gate.io WS...')
-        login_channel.login(header='', req_id='login-init')
-        
-        # Перевіряємо логін
-        for _ in range(10):
-            if logged_in:
-                break
-            await asyncio.sleep(0.5)
-        
-        if not logged_in:
-            log('WARNING: Login may have failed!')
+        while not logged_in:
+            log('Logging in to Gate.io WS...')
+            login_channel.login(header='', req_id=f'login-{int(time.time())}')
+            await asyncio.sleep(3)
+            if not logged_in:
+                log('Login not confirmed, retrying...')
+        log('Gate.io WS: Login confirmed!')
     
     # Ping кожні 20 сек
     async def ping_loop():
