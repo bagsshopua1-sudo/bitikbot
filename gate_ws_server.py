@@ -38,16 +38,31 @@ def on_login(c, response):
 def on_order(c, response):
     global pending_orders
     try:
-        resp_str = str(response)
-        data = json.loads(resp_str) if isinstance(response, str) else {}
+        # Виводимо всю відповідь для діагностики
+        log(f'Order response: {str(response)[:200]}')
         
+        # Шукаємо req_id в різних місцях
+        req_id = None
         if hasattr(response, 'request_id'):
             req_id = response.request_id
-        else:
+        elif isinstance(response, dict):
+            req_id = response.get('request_id')
+        elif isinstance(response, str):
+            data = json.loads(response)
             req_id = data.get('request_id')
+        
+        log(f'Found req_id: {req_id}, pending: {list(pending_orders.keys())}')
         
         if req_id and req_id in pending_orders:
             future = pending_orders.pop(req_id)
+            if not future.done():
+                asyncio.run_coroutine_threadsafe(
+                    set_result(future, response), loop
+                )
+        elif pending_orders:
+            # Якщо req_id не знайдено — відповідаємо першому pending
+            first_key = list(pending_orders.keys())[0]
+            future = pending_orders.pop(first_key)
             if not future.done():
                 asyncio.run_coroutine_threadsafe(
                     set_result(future, response), loop
