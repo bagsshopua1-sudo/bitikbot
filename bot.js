@@ -311,13 +311,44 @@ async function contractExists(ticker) {
   return { exists: false, contract };
 }
 
+// Відправка через Python WS сервіс
+function openOrderViaWS(contract, size) {
+  return new Promise((resolve, reject) => {
+    const net = require('net');
+    const client = net.createConnection('/tmp/gate_ws.sock', () => {
+      client.write(JSON.stringify({ contract, size }));
+    });
+    let data = '';
+    client.on('data', chunk => { data += chunk; });
+    client.on('end', () => {
+      try {
+        const r = JSON.parse(data);
+        if (r.success) resolve(r);
+        else reject(new Error(r.error || 'WS failed'));
+      } catch(e) { reject(e); }
+    });
+    client.on('error', reject);
+    setTimeout(() => { client.destroy(); reject(new Error('WS timeout')); }, 3000);
+  });
+}
+
 async function openOrderWithRetry(contract, size) {
+  // Спробуємо WS і REST паралельно — хто перший той і відкриє
+  try {
+    const wsResult = await openOrderViaWS(contract, size);
+    log('INFO', `Order via WS: ${wsResult.fill_price} (${wsResult.elapsed_ms?.toFixed(0)}ms)`);
+    return { fill_price: wsResult.fill_price };
+  } catch(e) {
+    log('WARN', `WS failed: ${e.message} — using REST`);
+  }
+
+  // Fallback REST
   for (let attempt = 1; attempt <= CONFIG.ORDER_RETRIES; attempt++) {
     try {
       const order = await gateRequest('POST', '/futures/usdt/orders', null, {
         contract, size, price: '0', tif: 'ioc', text: 't-listing',
       });
-      log('INFO', `Order opened on attempt ${attempt}`);
+      log('INFO', `Order opened via REST on attempt ${attempt}`);
       return order;
     } catch (e) {
       const msg = e.response?.data?.message || e.message;
