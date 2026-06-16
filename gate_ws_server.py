@@ -136,6 +136,12 @@ async def handle_client(reader, writer):
     except asyncio.TimeoutError:
         writer.write(json.dumps({'success': False, 'error': 'Timeout'}).encode())
         await writer.drain()
+    except ConnectionResetError:
+        global logged_in
+        logged_in = False
+        log('Connection reset — will re-login')
+        writer.write(json.dumps({'success': False, 'error': 'Connection reset'}).encode())
+        await writer.drain()
     except Exception as e:
         log(f'Handle client error: {e}')
         writer.write(json.dumps({'success': False, 'error': str(e)}).encode())
@@ -184,15 +190,20 @@ async def main():
                 log('Login not confirmed, retrying...')
         log('Gate.io WS: Login confirmed!')
     
-    # Ping кожні 20 сек
+    # Ping кожні 20 сек + перевірка логіну
     async def ping_loop():
         while True:
             await asyncio.sleep(20)
             try:
                 if conn:
                     log('Ping...')
-            except:
-                pass
+                # Якщо втратили логін — логінимось знову
+                if not logged_in:
+                    log('Lost login — re-logging in...')
+                    login_channel.login(header='', req_id=f'relogin-{int(time.time())}')
+                    await asyncio.sleep(3)
+            except Exception as e:
+                log(f'Ping error: {e}')
     
     await asyncio.gather(
         conn.run(),
