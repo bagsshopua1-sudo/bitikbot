@@ -610,7 +610,16 @@ async function main() {
   await updateContractsCache();
   setInterval(updateContractsCache, CONTRACTS_TTL);
 
-  // CoinListing WebSocket — миттєві лістинги Upbit
+  // ─── Upbit Monitor через проксі ──────────────────────────────────────────────
+  const UpbitMonitor = require('./upbit-monitor');
+  const monitor = new UpbitMonitor(async (ticker, seenAt) => {
+    await handleNewListing(ticker, seenAt);
+  });
+  const PROXIES = (process.env.UPBIT_PROXIES || '').split(',').filter(Boolean);
+  PROXIES.forEach(p => monitor.addProxy(p.trim()));
+  monitor.start(100); // 10 запитів/сек на проксі — офіційний ліміт Upbit
+
+  // CoinListing WebSocket — міттєві лістинги Upbit
   startCoinListingWS();
 
   await tick();
