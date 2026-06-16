@@ -251,22 +251,6 @@ function openOrderViaWS(contract, size) {
     }, 3000);
   });
 }
-      const order = await gateRequest('POST', '/futures/usdt/orders', null, {
-        contract, size, price: '0', tif: 'ioc', text: 't-listing',
-      });
-      log('INFO', `Order opened on attempt ${attempt}`);
-      return order;
-    } catch (e) {
-      const msg = e.response?.data?.message || e.message;
-      log('WARN', `Attempt ${attempt}/${CONFIG.ORDER_RETRIES}: ${msg}`);
-      if (attempt < CONFIG.ORDER_RETRIES) {
-        await new Promise(r => setTimeout(r, CONFIG.ORDER_RETRY_MS));
-      } else {
-        throw e;
-      }
-    }
-  }
-}
 
 async function handleNewListing(ticker, seenAt) {
   if (processedTickers.has(ticker)) return;
