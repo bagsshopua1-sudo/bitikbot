@@ -196,8 +196,61 @@ async function contractExists(ticker) {
 }
 
 async function openOrderWithRetry(contract, size) {
+  // Спочатку пробуємо через Python WebSocket сервіс (~40ms)
+  try {
+    const wsResult = await openOrderViaWS(contract, size);
+    if (wsResult && wsResult.success) {
+      log('INFO', `Order via WS: ${wsResult.fill_price} (${wsResult.elapsed_ms.toFixed(0)}ms)`);
+      return { fill_price: wsResult.fill_price, finish_as: wsResult.finish_as };
+    }
+  } catch(e) {
+    log('WARN', `WS order failed: ${e.message} — falling back to REST`);
+  }
+
+  // Fallback: REST з retry
   for (let attempt = 1; attempt <= CONFIG.ORDER_RETRIES; attempt++) {
     try {
+      const order = await gateRequest('POST', '/futures/usdt/orders', null, {
+        contract, size, price: '0', tif: 'ioc', text: 't-listing-rest',
+      });
+      log('INFO', `REST order opened on attempt ${attempt}`);
+      return order;
+    } catch (e) {
+      const msg = e.response?.data?.message || e.message;
+      log('WARN', `Attempt ${attempt}/${CONFIG.ORDER_RETRIES}: ${msg}`);
+      if (attempt < CONFIG.ORDER_RETRIES) {
+        await new Promise(r => setTimeout(r, CONFIG.ORDER_RETRY_MS));
+      } else {
+        throw e;
+      }
+    }
+  }
+}
+
+// Відправляємо ордер через Python WS сервіс
+function openOrderViaWS(contract, size) {
+  return new Promise((resolve, reject) => {
+    const net = require('net');
+    const client = net.createConnection('/tmp/gate_ws.sock', () => {
+      client.write(JSON.stringify({ contract, size }));
+    });
+
+    let data = '';
+    client.on('data', chunk => { data += chunk; });
+    client.on('end', () => {
+      try {
+        resolve(JSON.parse(data));
+      } catch(e) {
+        reject(new Error('Invalid WS response'));
+      }
+    });
+    client.on('error', reject);
+    setTimeout(() => {
+      client.destroy();
+      reject(new Error('WS socket timeout'));
+    }, 3000);
+  });
+}
       const order = await gateRequest('POST', '/futures/usdt/orders', null, {
         contract, size, price: '0', tif: 'ioc', text: 't-listing',
       });
