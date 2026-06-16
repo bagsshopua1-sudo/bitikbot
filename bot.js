@@ -617,7 +617,7 @@ async function main() {
   });
   const PROXIES = (process.env.UPBIT_PROXIES || '').split(',').filter(Boolean);
   PROXIES.forEach(p => monitor.addProxy(p.trim()));
-  monitor.start(100); // 10 запитів/сек на проксі — офіційний ліміт Upbit
+  monitor.start(300); // 3 запити/сек на проксі — безпечно
 
   // CoinListing WebSocket — міттєві лістинги Upbit
   startCoinListingWS();
