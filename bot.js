@@ -3,6 +3,8 @@ const axios = require('axios');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const WebSocket = require('ws');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 
 const LOG_FILE = path.join(__dirname, 'bot.log');
@@ -13,6 +15,13 @@ function log(level, message) {
   console.log(line);
   fs.appendFileSync(LOG_FILE, line + '\n');
 }
+
+// ─── HTTP Keep-Alive agent ────────────────────────────────────────────────────
+const keepAliveAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 10,
+  timeout: 30000,
+});
 
 const CONFIG = {
   GATE_API_KEY:     process.env.GATE_API_KEY     || '',
@@ -27,6 +36,105 @@ const CONFIG = {
   ORDER_RETRIES:    30,
   ORDER_RETRY_MS:   1000,
 };
+
+// ─── WS кеш цін від Gate.io ───────────────────────────────────────────────────
+const priceCache = new Map(); // contract → { markPrice, quanto }
+let priceWs = null;
+
+function startPriceWS() {
+  priceWs = new WebSocket('wss://fx-ws.gateio.ws/v4/ws/usdt');
+
+  priceWs.on('open', () => {
+    log('INFO', '[PriceWS] Connected to Gate.io');
+    // Підписуємось на всі тікери
+    priceWs.send(JSON.stringify({
+      time: Math.floor(Date.now() / 1000),
+      channel: 'futures.tickers',
+      event: 'subscribe',
+      payload: ['!all'],
+    }));
+  });
+
+  priceWs.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.channel === 'futures.tickers' && msg.event === 'update') {
+        const tickers = Array.isArray(msg.result) ? msg.result : [msg.result];
+        for (const t of tickers) {
+          if (t.contract && t.mark_price) {
+            priceCache.set(t.contract, {
+              markPrice: parseFloat(t.mark_price),
+              quanto: parseFloat(t.quanto_multiplier || '1'),
+            });
+          }
+        }
+      }
+    } catch(e) {}
+  });
+
+  priceWs.on('error', e => log('ERROR', `[PriceWS] ${e.message}`));
+  priceWs.on('close', () => {
+    log('WARN', '[PriceWS] Disconnected — reconnecting in 2s...');
+    setTimeout(startPriceWS, 2000);
+  });
+
+  // Ping кожні 20 сек
+  setInterval(() => {
+    if (priceWs && priceWs.readyState === WebSocket.OPEN) {
+      priceWs.send(JSON.stringify({ time: Math.floor(Date.now() / 1000), channel: 'futures.ping' }));
+    }
+  }, 20000);
+}
+
+// ─── WS кеш балансу від Gate.io ──────────────────────────────────────────────
+let wsBalance = null;
+let balanceWs = null;
+
+function signWs(channel, event, ts) {
+  const str = `channel=${channel}&event=${event}&time=${ts}`;
+  return crypto.createHmac('sha512', CONFIG.GATE_API_SECRET).update(str).digest('hex');
+}
+
+function startBalanceWS() {
+  balanceWs = new WebSocket('wss://fx-ws.gateio.ws/v4/ws/usdt');
+
+  balanceWs.on('open', () => {
+    log('INFO', '[BalanceWS] Connected to Gate.io');
+    const ts = Math.floor(Date.now() / 1000);
+    balanceWs.send(JSON.stringify({
+      time: ts,
+      channel: 'futures.balances',
+      event: 'subscribe',
+      payload: [],
+      auth: { method: 'api_key', KEY: CONFIG.GATE_API_KEY, SIGN: signWs('futures.balances', 'subscribe', ts) }
+    }));
+  });
+
+  balanceWs.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.channel === 'futures.balances' && msg.event === 'update') {
+        const result = Array.isArray(msg.result) ? msg.result[0] : msg.result;
+        if (result && result.available) {
+          wsBalance = parseFloat(result.available);
+          log('INFO', `[BalanceWS] Balance updated: ${wsBalance}`);
+        }
+      }
+    } catch(e) {}
+  });
+
+  balanceWs.on('error', e => log('ERROR', `[BalanceWS] ${e.message}`));
+  balanceWs.on('close', () => {
+    log('WARN', '[BalanceWS] Disconnected — reconnecting in 2s...');
+    setTimeout(startBalanceWS, 2000);
+  });
+
+  setInterval(() => {
+    if (balanceWs && balanceWs.readyState === WebSocket.OPEN) {
+      balanceWs.send(JSON.stringify({ time: Math.floor(Date.now() / 1000), channel: 'futures.ping' }));
+    }
+  }, 20000);
+}
 
 // ─── State ────────────────────────────────────────────────────────────────────
 const knownCoins = new Map();
@@ -142,6 +250,7 @@ async function gateRequest(method, endpoint, query, data) {
     headers: { 'KEY': CONFIG.GATE_API_KEY, 'SIGN': sig, 'Timestamp': ts, 'Content-Type': 'application/json' },
     data: data || undefined,
     timeout: 5000,
+    httpsAgent: keepAliveAgent,
   });
   return res.data;
 }
@@ -174,13 +283,20 @@ async function updateContractsCache() {
 async function contractExists(ticker) {
   const contract = `${ticker}_USDT`;
 
+  // Спочатку перевіряємо WS кеш цін (~0ms)
+  if (priceCache.has(contract)) {
+    const cached = priceCache.get(contract);
+    log('INFO', `[PriceCache] ${contract}: ${cached.markPrice}`);
+    return { exists: true, contract, markPrice: cached.markPrice, quanto: cached.quanto };
+  }
+
   if (Date.now() - contractsCacheUpdatedAt > CONTRACTS_TTL) {
     await updateContractsCache();
   }
 
   if (contractsCache.has(contract)) {
     try {
-      const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts/${contract}`, { timeout: 3000 });
+      const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts/${contract}`, { timeout: 3000, httpsAgent: keepAliveAgent });
       return {
         exists: true, contract,
         markPrice: parseFloat(res.data.mark_price),
@@ -196,24 +312,12 @@ async function contractExists(ticker) {
 }
 
 async function openOrderWithRetry(contract, size) {
-  // Спочатку пробуємо через Python WebSocket сервіс (~40ms)
-  try {
-    const wsResult = await openOrderViaWS(contract, size);
-    if (wsResult && wsResult.success) {
-      log('INFO', `Order via WS: ${wsResult.fill_price} (${wsResult.elapsed_ms.toFixed(0)}ms)`);
-      return { fill_price: wsResult.fill_price, finish_as: wsResult.finish_as };
-    }
-  } catch(e) {
-    log('WARN', `WS order failed: ${e.message} — falling back to REST`);
-  }
-
-  // Fallback: REST з retry
   for (let attempt = 1; attempt <= CONFIG.ORDER_RETRIES; attempt++) {
     try {
       const order = await gateRequest('POST', '/futures/usdt/orders', null, {
-        contract, size, price: '0', tif: 'ioc', text: 't-listing-rest',
+        contract, size, price: '0', tif: 'ioc', text: 't-listing',
       });
-      log('INFO', `REST order opened on attempt ${attempt}`);
+      log('INFO', `Order opened on attempt ${attempt}`);
       return order;
     } catch (e) {
       const msg = e.response?.data?.message || e.message;
@@ -227,31 +331,6 @@ async function openOrderWithRetry(contract, size) {
   }
 }
 
-// Відправляємо ордер через Python WS сервіс
-function openOrderViaWS(contract, size) {
-  return new Promise((resolve, reject) => {
-    const net = require('net');
-    const client = net.createConnection('/tmp/gate_ws.sock', () => {
-      client.write(JSON.stringify({ contract, size }));
-    });
-
-    let data = '';
-    client.on('data', chunk => { data += chunk; });
-    client.on('end', () => {
-      try {
-        resolve(JSON.parse(data));
-      } catch(e) {
-        reject(new Error('Invalid WS response'));
-      }
-    });
-    client.on('error', reject);
-    setTimeout(() => {
-      client.destroy();
-      reject(new Error('WS socket timeout'));
-    }, 3000);
-  });
-}
-
 async function handleNewListing(ticker, seenAt) {
   if (processedTickers.has(ticker)) return;
   processedTickers.set(ticker, Date.now());
@@ -261,10 +340,10 @@ async function handleNewListing(ticker, seenAt) {
   // Оптимізація 4: паралельно перевіряємо контракт і баланс
   const [contractData, freshAccount] = await Promise.all([
     contractExists(ticker),
-    gateRequest('GET', '/futures/usdt/accounts', null, null),
+    wsBalance ? Promise.resolve({ available: wsBalance }) : gateRequest('GET', '/futures/usdt/accounts', null, null),
   ]);
 
-  const available = parseFloat(freshAccount.available);
+  const available = wsBalance || parseFloat(freshAccount.available);
 
   if (!contractData.exists) {
     log('WARN', `No Gate.io contract for ${ticker}`);
@@ -522,6 +601,10 @@ async function main() {
     'Оптимізації: кеш балансу + async TG + паралельні запити\n' +
     `Плече: ${CONFIG.LEVERAGE}x`
   );
+
+  // Запускаємо WS кеш цін і балансу
+  startPriceWS();
+  startBalanceWS();
 
   // Завантажуємо кеш контрактів
   await updateContractsCache();
