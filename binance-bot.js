@@ -24,8 +24,8 @@ const CONFIG = {
   POLL_INTERVAL_MS:     2000,
   GATE_BASE:            'https://api.gateio.ws/api/v4',
   BINANCE_ANNOUNCE_URL: 'https://www.binance.com/bapi/composite/v1/public/cms/article/catalog/list/query?catalogId=48&pageNo=1&pageSize=10',
-  ORDER_RETRIES:        10,
-  ORDER_RETRY_MS:       300,
+  ORDER_RETRIES:        30,
+  ORDER_RETRY_MS:       1000,
 };
 
 const SKIP_WORDS    = ['delist', 'suspend', 'deprecat', 'remove', 'tradfi', 'pre-ipo', 'multiple'];
@@ -155,13 +155,44 @@ async function contractExists(ticker) {
   return { exists: false, contract };
 }
 
+// Відправка через Python WS сервіс
+function openOrderViaWS(contract, size) {
+  return new Promise((resolve, reject) => {
+    const net = require('net');
+    const client = net.createConnection('/tmp/gate_ws.sock', () => {
+      client.write(JSON.stringify({ contract, size }));
+    });
+    let data = '';
+    client.on('data', chunk => { data += chunk; });
+    client.on('end', () => {
+      try {
+        const r = JSON.parse(data);
+        if (r.success) resolve(r);
+        else reject(new Error(r.error || 'WS failed'));
+      } catch(e) { reject(e); }
+    });
+    client.on('error', reject);
+    setTimeout(() => { client.destroy(); reject(new Error('WS timeout')); }, 3000);
+  });
+}
+
 async function openOrderWithRetry(contract, size) {
+  // Спробуємо WS спочатку
+  try {
+    const wsResult = await openOrderViaWS(contract, size);
+    log('INFO', `Order via WS: ${wsResult.fill_price} (${wsResult.elapsed_ms?.toFixed(0)}ms)`);
+    return { fill_price: wsResult.fill_price };
+  } catch(e) {
+    log('WARN', `WS failed: ${e.message} — using REST`);
+  }
+
+  // Fallback REST
   for (let attempt = 1; attempt <= CONFIG.ORDER_RETRIES; attempt++) {
     try {
       const order = await gateRequest('POST', '/futures/usdt/orders', null, {
         contract, size, price: '0', tif: 'ioc', text: 't-listing',
       });
-      log('INFO', `Order opened on attempt ${attempt}`);
+      log('INFO', `Order opened via REST on attempt ${attempt}`);
       return order;
     } catch (e) {
       const msg = e.response?.data?.message || e.message;
@@ -176,11 +207,12 @@ async function openOrderWithRetry(contract, size) {
 }
 
 // ─── Відкриття позиції ────────────────────────────────────────────────────────
-async function openPosition(ticker, marginPercent, seenAt) {
+async function openPosition(ticker, marginPercent, seenAt, isShort = false) {
   if (processedTickers.has(ticker)) return false;
   processedTickers.set(ticker, Date.now());
 
-  log('INFO', `Opening [Binance]: ${ticker} (${marginPercent}% margin)`);
+  const direction = isShort ? 'SHORT' : 'LONG';
+  log('INFO', `Opening [Binance] ${direction}: ${ticker} (${marginPercent}% margin)`);
 
   // Завжди беремо свіжий баланс
   const [contractData, freshAccount] = await Promise.all([
@@ -203,8 +235,9 @@ async function openPosition(ticker, marginPercent, seenAt) {
   ).catch(e => log('WARN', `Leverage: ${e.response?.data?.message || e.message}`));
 
   const useMargin = available * (marginPercent / 100);
-  const size = Math.max(1, Math.floor((useMargin * CONFIG.LEVERAGE) / (markPrice * quanto)));
-  const posValue = (size * markPrice * quanto).toFixed(2);
+  const absSize = Math.max(1, Math.floor((useMargin * CONFIG.LEVERAGE) / (markPrice * quanto)));
+  const size = isShort ? -absSize : absSize;
+  const posValue = (absSize * markPrice * quanto).toFixed(2);
 
   let order;
   try {
@@ -239,8 +272,7 @@ async function openPosition(ticker, marginPercent, seenAt) {
 }
 
 // ─── Розподіл балансу між тікерами ───────────────────────────────────────────
-async function handleListing(tickers, seenAt) {
-  // Оптимізація 4: паралельно перевіряємо всі контракти
+async function handleListing(tickers, seenAt, isShort = false) {
   const checks = await Promise.all(tickers.map(t => contractExists(t)));
   const available = tickers.filter((t, i) => checks[i].exists);
   const notAvailable = tickers.filter((t, i) => !checks[i].exists);
@@ -250,7 +282,6 @@ async function handleListing(tickers, seenAt) {
     sendTelegram(`Binance лістинг — немає на Gate.io: ${notAvailable.join(', ')}`);
   }
 
-  // Розподіл балансу
   let marginPerTicker;
   if (available.length === 0) return;
   if (tickers.length === 1) marginPerTicker = 80;
@@ -258,16 +289,14 @@ async function handleListing(tickers, seenAt) {
   else if (tickers.length === 2) marginPerTicker = 38;
   else marginPerTicker = Math.floor(75 / available.length);
 
-  // Оптимізація 4: відкриваємо всі позиції ПАРАЛЕЛЬНО
-  await Promise.all(available.map(ticker => openPosition(ticker, marginPerTicker, seenAt)));
+  await Promise.all(available.map(ticker => openPosition(ticker, marginPerTicker, seenAt, isShort)));
 
-  // Чекаємо недоступні
   if (notAvailable.length > 0) {
     for (const ticker of notAvailable) {
       for (let i = 0; i < 10; i++) {
         const { exists } = await contractExists(ticker);
         if (exists) {
-          await openPosition(ticker, available.length > 0 ? 40 : 90, seenAt);
+          await openPosition(ticker, available.length > 0 ? 40 : 90, seenAt, isShort);
           break;
         }
         await new Promise(r => setTimeout(r, 3000));
@@ -370,19 +399,21 @@ function startCoinListingWS() {
       const title = msg.title || '';
       const titleLower = title.toLowerCase();
 
-      // Пропускаємо делістинги і технічні
-      if (SKIP_WORDS.some(w => titleLower.includes(w))) {
+      // Пропускаємо технічні
+      if (SKIP_WORDS.filter(w => !['monitoring', 'delist', 'warning', 'caution'].includes(w)).some(w => titleLower.includes(w))) {
         log('INFO', `[CoinListing] Skip: ${title}`);
         return;
       }
+
+      const isShort = ['monitoring', 'delist', 'warning', 'caution'].some(w => titleLower.includes(w));
 
       const seenAt = Date.now();
       const validTickers = msg.coins.filter(t => t && t !== '***');
 
       if (validTickers.length === 0) return;
 
-      log('INFO', `[CoinListing] BINANCE LISTING: ${validTickers.join(', ')} | ${title}`);
-      await handleListing(validTickers, seenAt);
+      log('INFO', `[CoinListing] BINANCE ${isShort ? 'DELIST (SHORT)' : 'LISTING (LONG)'}: ${validTickers.join(', ')} | ${title}`);
+      await handleListing(validTickers, seenAt, isShort);
 
     } catch(e) {
       log('ERROR', `[CoinListing] Parse error: ${e.message}`);
