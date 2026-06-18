@@ -207,27 +207,27 @@ async function openOrderWithRetry(contract, size) {
 }
 
 // ─── Відкриття позиції ────────────────────────────────────────────────────────
-async function openPosition(ticker, marginPercent, seenAt, isShort = false) {
+async function openPosition(ticker, marginPercent, seenAt, isShort = false, sharedBalance = null, contractData = null) {
   if (processedTickers.has(ticker)) return false;
   processedTickers.set(ticker, Date.now());
 
   const direction = isShort ? 'SHORT' : 'LONG';
   log('INFO', `Opening [Binance] ${direction}: ${ticker} (${marginPercent}% margin)`);
 
-  // Завжди беремо свіжий баланс
-  const [contractData, freshAccount] = await Promise.all([
-    contractExists(ticker),
-    gateRequest('GET', '/futures/usdt/accounts', null, null),
+  // Використовуємо готові дані якщо є, інакше запитуємо
+  const [resolvedContract, freshAccount] = await Promise.all([
+    contractData ? Promise.resolve(contractData) : contractExists(ticker),
+    sharedBalance ? Promise.resolve({ available: sharedBalance }) : gateRequest('GET', '/futures/usdt/accounts', null, null),
   ]);
 
-  const available = parseFloat(freshAccount.available);
+  const available = sharedBalance || parseFloat(freshAccount.available);
 
-  if (!contractData.exists) {
+  if (!resolvedContract.exists) {
     log('WARN', `No Gate.io contract for ${ticker}`);
     return false;
   }
 
-  const { contract, markPrice, quanto } = contractData;
+  const { contract, markPrice, quanto } = resolvedContract;
 
   // Плече паралельно (не чекаємо)
   gateRequest('POST', `/futures/usdt/positions/${contract}/leverage`,
@@ -273,9 +273,16 @@ async function openPosition(ticker, marginPercent, seenAt, isShort = false) {
 
 // ─── Розподіл балансу між тікерами ───────────────────────────────────────────
 async function handleListing(tickers, seenAt, isShort = false) {
-  const checks = await Promise.all(tickers.map(t => contractExists(t)));
+  // Паралельно: всі контракти + баланс одночасно
+  const [checks, freshAccount] = await Promise.all([
+    Promise.all(tickers.map(t => contractExists(t))),
+    gateRequest('GET', '/futures/usdt/accounts', null, null),
+  ]);
+
+  const availableChecks = checks.filter(c => c.exists);
   const available = tickers.filter((t, i) => checks[i].exists);
   const notAvailable = tickers.filter((t, i) => !checks[i].exists);
+  const sharedBalance = parseFloat(freshAccount.available);
 
   if (notAvailable.length > 0) {
     log('WARN', `Not on Gate.io: ${notAvailable.join(', ')}`);
@@ -289,14 +296,15 @@ async function handleListing(tickers, seenAt, isShort = false) {
   else if (tickers.length === 2) marginPerTicker = 38;
   else marginPerTicker = Math.floor(75 / available.length);
 
-  await Promise.all(available.map(ticker => openPosition(ticker, marginPerTicker, seenAt, isShort)));
+  // Відкриваємо всі одночасно — передаємо вже отримані дані контракту
+  await Promise.all(available.map((ticker, i) => openPosition(ticker, marginPerTicker, seenAt, isShort, sharedBalance, availableChecks[i])));
 
   if (notAvailable.length > 0) {
     for (const ticker of notAvailable) {
       for (let i = 0; i < 10; i++) {
         const { exists } = await contractExists(ticker);
         if (exists) {
-          await openPosition(ticker, available.length > 0 ? 40 : 90, seenAt, isShort);
+          await openPosition(ticker, available.length > 0 ? 40 : 90, seenAt, isShort, sharedBalance);
           break;
         }
         await new Promise(r => setTimeout(r, 3000));
