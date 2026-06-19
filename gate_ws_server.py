@@ -32,25 +32,38 @@ def on_login(c, response):
         log(f'Login error: {e}')
         logged_in = True
 
+ack_received = set()  # req_id які вже отримали ACK
+
 def on_order(c, response):
-    global pending_orders
+    global pending_orders, ack_received
     try:
         if not pending_orders:
             return
         resp_str = str(response)
-        # Пропускаємо ACK відповідь (містить req_param але не id ордера)
-        if 'req_param' in resp_str and '"id":' not in resp_str.split('req_param')[1][:50]:
-            log(f'[on_order] ACK received, waiting for result...')
+        
+        # Знаходимо req_id з відповіді
+        req_id = None
+        for key in list(pending_orders.keys()):
+            if key in resp_str:
+                req_id = key
+                break
+        
+        if not req_id:
+            req_id = list(pending_orders.keys())[0]
+        
+        # Якщо це ACK (перша відповідь) — чекаємо другу
+        if req_id in resp_str and 'req_param' in resp_str:
+            log(f'[on_order] ACK for {req_id}, waiting for result...')
+            ack_received.add(req_id)
             return
-        # Пропускаємо логін відповідь
-        if 'uid' in resp_str and 'api_key' in resp_str and 'fill_price' not in resp_str:
-            log('[on_order] Login response, skipping')
-            return
-        log(f'[on_order] Result received: {resp_str[:100]}')
-        first_key = list(pending_orders.keys())[0]
-        future = pending_orders.pop(first_key)
-        if not future.done():
-            asyncio.run_coroutine_threadsafe(set_result(future, response), loop)
+        
+        # Це реальний результат ордера
+        if req_id in pending_orders:
+            log(f'[on_order] Result for {req_id}: {resp_str[:100]}')
+            future = pending_orders.pop(req_id)
+            ack_received.discard(req_id)
+            if not future.done():
+                asyncio.run_coroutine_threadsafe(set_result(future, response), loop)
     except Exception as e:
         log(f'Order error: {e}')
 
