@@ -36,14 +36,17 @@ def on_order(c, response):
     global pending_orders
     try:
         if not pending_orders:
-            log(f'[on_order] No pending orders, skipping: {str(response)[:100]}')
             return
         resp_str = str(response)
-        log(f'[on_order] Response: {resp_str[:100]}')
-        # Якщо це відповідь на логін — ігноруємо
-        if 'uid' in resp_str and 'api_key' in resp_str:
-            log('[on_order] Skipping login response')
+        # Пропускаємо ACK відповідь (містить req_param але не id ордера)
+        if 'req_param' in resp_str and '"id":' not in resp_str.split('req_param')[1][:50]:
+            log(f'[on_order] ACK received, waiting for result...')
             return
+        # Пропускаємо логін відповідь
+        if 'uid' in resp_str and 'api_key' in resp_str and 'fill_price' not in resp_str:
+            log('[on_order] Login response, skipping')
+            return
+        log(f'[on_order] Result received: {resp_str[:100]}')
         first_key = list(pending_orders.keys())[0]
         future = pending_orders.pop(first_key)
         if not future.done():
@@ -81,10 +84,8 @@ async def handle_client(reader, writer):
         result = await place_order(contract, size)
         elapsed = (time.time() - start) * 1000
         result_str = str(result)
-        # Перевіряємо що відповідь містить дані ордера (не логіна)
-        success = ('filled' in result_str or 'finished' in result_str) and 'fill_price' in result_str
-        if not success and '200' in result_str and 'fill_price' in result_str:
-            success = True
+        # success тільки якщо є реальний результат ордера з id
+        success = '200' in result_str and ('fill_price' in result_str or '"id":' in result_str) and 'req_param' not in result_str
         fill_price = '0'
         try:
             if hasattr(result, 'data') and result.data and hasattr(result.data, 'result'):
