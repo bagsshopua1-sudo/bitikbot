@@ -36,6 +36,13 @@ def on_order(c, response):
     global pending_orders
     try:
         if not pending_orders:
+            log(f'[on_order] No pending orders, skipping: {str(response)[:100]}')
+            return
+        resp_str = str(response)
+        log(f'[on_order] Response: {resp_str[:100]}')
+        # Якщо це відповідь на логін — ігноруємо
+        if 'uid' in resp_str and 'api_key' in resp_str:
+            log('[on_order] Skipping login response')
             return
         first_key = list(pending_orders.keys())[0]
         future = pending_orders.pop(first_key)
@@ -74,7 +81,10 @@ async def handle_client(reader, writer):
         result = await place_order(contract, size)
         elapsed = (time.time() - start) * 1000
         result_str = str(result)
-        success = '200' in result_str or 'filled' in result_str or 'finished' in result_str
+        # Перевіряємо що відповідь містить дані ордера (не логіна)
+        success = ('filled' in result_str or 'finished' in result_str) and 'fill_price' in result_str
+        if not success and '200' in result_str and 'fill_price' in result_str:
+            success = True
         fill_price = '0'
         try:
             if hasattr(result, 'data') and result.data and hasattr(result.data, 'result'):
