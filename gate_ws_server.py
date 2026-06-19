@@ -101,9 +101,11 @@ async def handle_client(reader, writer):
         success = '200' in result_str and ('fill_price' in result_str or '"id":' in result_str) and 'req_param' not in result_str
         fill_price = '0'
         try:
-            if hasattr(result, 'data') and result.data and hasattr(result.data, 'result'):
-                r = result.data.result
-                fill_price = str(r.get('fill_price', '0')) if isinstance(r, dict) else '0'
+            resp_str = str(result)
+            import re
+            match = re.search(r'"fill_price":"([^"]+)"', resp_str)
+            if match:
+                fill_price = match.group(1)
         except:
             pass
         response = {'success': success, 'fill_price': fill_price, 'elapsed_ms': elapsed, 'error': ''}
