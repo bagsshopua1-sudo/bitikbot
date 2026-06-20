@@ -100,11 +100,11 @@ if (fs.existsSync(SOCKET_PATH)) fs.unlinkSync(SOCKET_PATH);
 
 const server = net.createServer((client) => {
   let data = '';
-  client.on('data', chunk => { data += chunk; });
-  client.on('end', async () => {
-    const start = Date.now();
+  client.on('data', async chunk => {
+    data += chunk;
     try {
-      const req = JSON.parse(data);
+      const req = JSON.parse(data); // спробуємо парсити одразу
+      const start = Date.now();
       const symbol = req.symbol || '';
       const quantity = req.quantity || 0;
       const side = req.side || 'BUY';
@@ -128,8 +128,9 @@ const server = net.createServer((client) => {
       }), () => client.end());
 
     } catch(e) {
+      if (e instanceof SyntaxError) return; // не повний JSON ще
       log(`Error: ${e.message}`);
-      client.write(JSON.stringify({ success: false, error: e.message, fill_price: '0', elapsed_ms: Date.now()-start }), () => client.end());
+      client.write(JSON.stringify({ success: false, error: e.message, fill_price: '0', elapsed_ms: 0 }), () => client.end());
     }
   });
   client.on('error', () => {});
