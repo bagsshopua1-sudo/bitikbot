@@ -23,7 +23,28 @@ const keepAliveAgent = new https.Agent({
   timeout: 30000,
 });
 
-// ─── Binance Futures WS напряму ───────────────────────────────────────────────
+// ─── Binance Price Cache ──────────────────────────────────────────────────────
+const binancePriceCache = new Map(); // symbol → price
+
+function startBinancePriceStream() {
+  const ws = new WebSocket('wss://fstream.binance.com/ws/!miniTicker@arr');
+  ws.on('message', (data) => {
+    try {
+      const tickers = JSON.parse(data.toString());
+      if (Array.isArray(tickers)) {
+        tickers.forEach(t => {
+          if (t.s && t.c) binancePriceCache.set(t.s, parseFloat(t.c));
+        });
+      }
+    } catch(e) {}
+  });
+  ws.on('close', () => {
+    log('WARN', '[BinancePriceWS] Disconnected — reconnecting...');
+    setTimeout(startBinancePriceStream, 2000);
+  });
+  ws.on('open', () => log('INFO', '[BinancePriceWS] Connected ✅'));
+  ws.on('error', e => log('ERROR', `[BinancePriceWS] ${e.message}`));
+}
 const BINANCE_KEY = process.env.BINANCE_API_KEY || '';
 const BINANCE_SECRET = process.env.BINANCE_API_SECRET || '';
 let binanceWs = null;
@@ -429,8 +450,9 @@ async function openOrderWithRetry(contract, size) {
     promises.push(
       (async () => {
         try {
-          const r = await axios.get(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${binanceSymbol}`);
-          const price = parseFloat(r.data.price);
+          const price = binancePriceCache.has(binanceSymbol)
+            ? binancePriceCache.get(binanceSymbol)
+            : parseFloat((await axios.get(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${binanceSymbol}`)).data.price);
           const quantity = Math.max(1, Math.round((size * 0.1) / price * 10) / 10);
           const result = await openOrderBinanceWS(binanceSymbol, quantity, 'BUY');
           if (result.status === 200) {
@@ -746,6 +768,7 @@ async function main() {
   // Binance WS для швидкого відкриття (~3-5ms)
   if (BINANCE_KEY && BINANCE_SECRET) {
     connectBinanceWS();
+    startBinancePriceStream();
     await updateBinanceFuturesCache();
     setInterval(updateBinanceFuturesCache, 5 * 60 * 1000);
   }
