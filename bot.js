@@ -394,17 +394,8 @@ async function contractExists(ticker) {
   }
 
   if (contractsCache.has(contract)) {
-    try {
-      const res = await axios.get(`${CONFIG.GATE_BASE}/futures/usdt/contracts/${contract}`, { timeout: 3000, httpsAgent: keepAliveAgent });
-      return {
-        exists: true, contract,
-        markPrice: parseFloat(res.data.mark_price),
-        quanto: parseFloat(res.data.quanto_multiplier || '1'),
-      };
-    } catch(e) {
-      const data = contractsCache.get(contract);
-      return { exists: true, contract, markPrice: data.markPrice, quanto: data.quanto };
-    }
+    const data = contractsCache.get(contract);
+    return { exists: true, contract, markPrice: data.markPrice, quanto: data.quanto };
   }
 
   return { exists: false, contract };
