@@ -132,8 +132,8 @@ const CONFIG = {
   POLL_INTERVAL_MS: 2000,
   GATE_BASE:        'https://api.gateio.ws/api/v4',
   UPBIT_CRIX_URL:   'https://crix-static.upbit.com/v2/crix_master',
-  ORDER_RETRIES:    30,
-  ORDER_RETRY_MS:   1000,
+  ORDER_RETRIES:    3,
+  ORDER_RETRY_MS:   50,
 };
 
 // ─── WS кеш цін від Gate.io ───────────────────────────────────────────────────
@@ -462,23 +462,24 @@ async function openOrderWithRetry(contract, size) {
   const success = results.filter(r => r && r.success);
   if (success.length > 0) return success[0];
 
-  // Fallback REST
-  for (let attempt = 1; attempt <= CONFIG.ORDER_RETRIES; attempt++) {
-    try {
-      const order = await gateRequest('POST', '/futures/usdt/orders', null, {
-        contract, size, price: '0', tif: 'ioc', text: 't-listing',
-      });
-      log('INFO', `Order opened via REST on attempt ${attempt}`);
-      return order;
-    } catch (e) {
-      const msg = e.response?.data?.message || e.message;
-      log('WARN', `Attempt ${attempt}/${CONFIG.ORDER_RETRIES}: ${msg}`);
-      if (attempt < CONFIG.ORDER_RETRIES) {
-        await new Promise(r => setTimeout(r, CONFIG.ORDER_RETRY_MS));
-      } else {
-        throw e;
-      }
-    }
+  // WS retry — ще раз через Gate.io WS без затримки
+  log('WARN', 'First attempt failed — retrying via Gate.io WS...');
+  try {
+    const wsResult = await openOrderViaWS(contract, size);
+    log('INFO', `Order via Gate.io WS retry: ${wsResult.fill_price}`);
+    return wsResult;
+  } catch(e) {
+    log('WARN', `Gate.io WS retry failed: ${e.message}`);
+  }
+
+  // Остання спроба
+  try {
+    const wsResult = await openOrderViaWS(contract, size);
+    log('INFO', `Order via Gate.io WS retry 2: ${wsResult.fill_price}`);
+    return wsResult;
+  } catch(e) {
+    log('ERROR', `All WS attempts failed: ${e.message}`);
+    throw e;
   }
 }
 
@@ -486,13 +487,15 @@ async function handleNewListing(ticker, seenAt) {
   if (processedTickers.has(ticker)) return;
   processedTickers.set(ticker, Date.now());
 
+  const t0 = Date.now();
   log('INFO', `NEW LISTING [Upbit]: ${ticker}`);
 
-  // Оптимізація 4: паралельно перевіряємо контракт і баланс
+  // Паралельно перевіряємо контракт і баланс
   const [contractData, freshAccount] = await Promise.all([
     contractExists(ticker),
     wsBalance ? Promise.resolve({ available: wsBalance }) : gateRequest('GET', '/futures/usdt/accounts', null, null),
   ]);
+  log('INFO', `T1 контракт+баланс: ${Date.now()-t0}ms`);
 
   const available = wsBalance || parseFloat(freshAccount.available);
 
@@ -504,13 +507,10 @@ async function handleNewListing(ticker, seenAt) {
 
   const { contract, markPrice, quanto } = contractData;
 
-  // Плече встановлюємо паралельно з розрахунком розміру (не чекаємо)
   gateRequest('POST', `/futures/usdt/positions/${contract}/leverage`,
     { leverage: '0', cross_leverage_limit: String(CONFIG.LEVERAGE) }, null
   ).catch(e => log('WARN', `Leverage: ${e.response?.data?.message || e.message}`));
 
-  // Підбираємо розмір так щоб маржа точно влізала в 75% балансу
-  // Враховуємо що Gate.io додає ~15% буфер до маржі
   const targetMargin = available * 0.65;
   let size = Math.max(1, Math.floor((targetMargin * CONFIG.LEVERAGE) / (markPrice * quanto)));
   
@@ -519,9 +519,11 @@ async function handleNewListing(ticker, seenAt) {
 
   log('INFO', `Opening: ${contract} size=${size} price=${markPrice} value=$${posValue}`);
 
+  const t2 = Date.now();
   let order;
   try {
     order = await openOrderWithRetry(contract, size);
+    log('INFO', `T2 ордер: ${Date.now()-t2}ms | Загально: ${Date.now()-t0}ms`);
   } catch (e) {
     log('ERROR', `All retries failed: ${e.response?.data?.message || e.message}`);
     sendTelegram(`ПОМИЛКА [Upbit] ${contract}: ${e.response?.data?.message || e.message}`);
