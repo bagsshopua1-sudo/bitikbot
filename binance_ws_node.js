@@ -125,12 +125,12 @@ const server = net.createServer((client) => {
         fill_price: fillPrice,
         elapsed_ms: elapsed,
         error: success ? '' : JSON.stringify(result.error || '')
-      }));
+      }), () => client.end());
+
     } catch(e) {
       log(`Error: ${e.message}`);
-      client.write(JSON.stringify({ success: false, error: e.message, fill_price: '0', elapsed_ms: Date.now()-start }));
+      client.write(JSON.stringify({ success: false, error: e.message, fill_price: '0', elapsed_ms: Date.now()-start }), () => client.end());
     }
-    client.end();
   });
   client.on('error', () => {});
 });
