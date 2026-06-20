@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import time
-import hmac
+import hmac as hmac_lib
 import hashlib
 import websockets
 from dotenv import load_dotenv
@@ -14,7 +14,7 @@ SECRET = os.getenv('BINANCE_API_SECRET')
 SOCKET_PATH = '/tmp/binance_ws.sock'
 
 ws_conn = None
-logged_in = False
+connected = False
 pending_orders = {}
 req_counter = 0
 loop = None
@@ -25,45 +25,19 @@ def log(msg):
 def sign_hmac(params: dict) -> str:
     sorted_params = sorted(params.items())
     query = '&'.join(f'{k}={v}' for k, v in sorted_params)
-    return hmac.new(SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    return hmac_lib.new(SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
 async def connect_binance():
-    global ws_conn, logged_in
+    global ws_conn, connected
     while True:
         try:
-            log('Connecting to Binance Futures WS API...')
+            log('Connecting to Binance Futures WS...')
             async with websockets.connect('wss://ws-fapi.binance.com/ws-fapi/v1') as ws:
                 ws_conn = ws
-                log('Connected!')
-
-                # Логін через session.logon з HMAC
-                ts = int(time.time() * 1000)
-                req_id = f'login-{ts}'
-                params = {
-                    'apiKey': KEY,
-                    'timestamp': ts,
-                }
-                params['signature'] = sign_hmac(params)
-
-                await ws.send(json.dumps({
-                    'id': req_id,
-                    'method': 'session.logon',
-                    'params': params
-                }))
-
+                connected = True
+                log('Connected! ✅')
                 async for msg in ws:
                     data = json.loads(msg)
-
-                    # Логін відповідь
-                    if data.get('id', '').startswith('login'):
-                        if data.get('status') == 200:
-                            logged_in = True
-                            log('Binance WS: Logged in! ✅')
-                        else:
-                            log(f'Login failed: {data.get("error", data)}')
-                        continue
-
-                    # Відповідь на ордер
                     resp_id = data.get('id', '')
                     if resp_id in pending_orders:
                         future = pending_orders.pop(resp_id)
@@ -71,10 +45,9 @@ async def connect_binance():
                             asyncio.run_coroutine_threadsafe(
                                 set_result(future, data), loop
                             )
-
         except Exception as e:
             log(f'WS Error: {e} — reconnecting in 2s...')
-            logged_in = False
+            connected = False
             ws_conn = None
             await asyncio.sleep(2)
 
@@ -84,8 +57,8 @@ async def set_result(future, result):
 
 async def place_order(symbol: str, quantity: float, side: str = 'BUY'):
     global req_counter
-    if not logged_in or not ws_conn:
-        raise Exception('Not logged in')
+    if not connected or not ws_conn:
+        raise Exception('Not connected')
 
     req_counter += 1
     req_id = f'order-{req_counter}'
@@ -161,20 +134,20 @@ async def start_server():
     log(f'Unix socket started: {SOCKET_PATH}')
     return server
 
-async def check_login():
+async def check_conn():
     while True:
         await asyncio.sleep(5)
-        if not logged_in:
-            log('Not logged in — waiting for reconnect...')
+        if not connected:
+            log('Not connected — waiting for reconnect...')
 
 async def main():
     global loop
     loop = asyncio.get_event_loop()
-    log('Starting Binance WS Service (HMAC)...')
+    log('Starting Binance WS Service (HMAC per-request)...')
     server = await start_server()
     await asyncio.gather(
         connect_binance(),
-        check_login(),
+        check_conn(),
         server.serve_forever()
     )
 
