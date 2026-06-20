@@ -58,6 +58,36 @@ function connectBinance() {
   ws.on('ping', (data) => ws.pong(data));
 }
 
+const https = require('https');
+const leverageCache = new Set(); // символи де вже встановили плече
+
+async function setLeverage(symbol, leverage = 10) {
+  if (leverageCache.has(symbol)) return; // вже встановлено
+  const ts = Date.now();
+  const params = { symbol, leverage: String(leverage), timestamp: ts };
+  const sorted = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
+  const sig = crypto.createHmac('sha256', SECRET).update(sorted).digest('hex');
+  
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'fapi.binance.com',
+      path: `/fapi/v1/leverage?${sorted}&signature=${sig}`,
+      method: 'POST',
+      headers: { 'X-MBX-APIKEY': KEY }
+    }, (res) => {
+      let d = '';
+      res.on('data', x => d += x);
+      res.on('end', () => {
+        leverageCache.add(symbol);
+        log(`Leverage set: ${symbol} ${leverage}x`);
+        resolve();
+      });
+    });
+    req.on('error', () => resolve());
+    req.end();
+  });
+}
+
 function placeOrder(symbol, quantity, side = 'BUY') {
   return new Promise((resolve, reject) => {
     if (!connected || !ws) {
@@ -110,6 +140,9 @@ const server = net.createServer((client) => {
       const side = req.side || 'BUY';
 
       log(`Order: ${side} ${quantity} ${symbol}`);
+
+      // Встановлюємо плече 10x (тільки перший раз)
+      await setLeverage(symbol, 10);
 
       const result = await placeOrder(symbol, quantity, side);
       const elapsed = Date.now() - start;
