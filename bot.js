@@ -414,32 +414,40 @@ async function openOrderWithRetry(contract, size) {
   const ticker = contract.replace('_USDT', '');
   const binanceSymbol = ticker + 'USDT';
 
-  // Спробуємо Binance WS якщо є контракт (~3-5ms)
+  // Відкриваємо паралельно на Gate.io і Binance (для тесту)
+  const promises = [];
+
+  // Gate.io WS завжди
+  promises.push(
+    openOrderViaWS(contract, size)
+      .then(r => { log('INFO', `Order via Gate.io WS: ${r.fill_price} (${r.elapsed_ms?.toFixed(0)}ms)`); return { via: 'GATE', ...r }; })
+      .catch(e => { log('WARN', `Gate.io WS failed: ${e.message}`); return null; })
+  );
+
+  // Binance WS якщо є контракт
   if (binanceConnected && binanceFuturesCache.has(binanceSymbol)) {
-    try {
-      const start = Date.now();
-      const r = await axios.get(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${binanceSymbol}`);
-      const price = parseFloat(r.data.price);
-      const quantity = Math.max(1, Math.round((size * 0.1) / price * 10) / 10);
-      const result = await openOrderBinanceWS(binanceSymbol, quantity, 'BUY');
-      if (result.status === 200) {
-        const elapsed = Date.now() - start;
-        log('INFO', `Order via Binance WS: ${result.result?.avgPrice || '0'} (${elapsed}ms)`);
-        return { fill_price: result.result?.avgPrice || '0' };
-      }
-    } catch(e) {
-      log('WARN', `Binance WS failed: ${e.message} — falling back to Gate.io`);
-    }
+    promises.push(
+      (async () => {
+        try {
+          const r = await axios.get(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${binanceSymbol}`);
+          const price = parseFloat(r.data.price);
+          const quantity = Math.max(1, Math.round((size * 0.1) / price * 10) / 10);
+          const result = await openOrderBinanceWS(binanceSymbol, quantity, 'BUY');
+          if (result.status === 200) {
+            log('INFO', `Order via Binance WS: ${result.result?.avgPrice || '0'}`);
+            return { via: 'BINANCE', fill_price: result.result?.avgPrice || '0', success: true };
+          }
+        } catch(e) {
+          log('WARN', `Binance WS failed: ${e.message}`);
+          return null;
+        }
+      })()
+    );
   }
 
-  // Спробуємо Gate.io WS (~45ms)
-  try {
-    const wsResult = await openOrderViaWS(contract, size);
-    log('INFO', `Order via Gate.io WS: ${wsResult.fill_price} (${wsResult.elapsed_ms?.toFixed(0)}ms)`);
-    return { fill_price: wsResult.fill_price };
-  } catch(e) {
-    log('WARN', `WS failed: ${e.message} — using REST`);
-  }
+  const results = await Promise.all(promises);
+  const success = results.filter(r => r && r.success);
+  if (success.length > 0) return success[0];
 
   // Fallback REST
   for (let attempt = 1; attempt <= CONFIG.ORDER_RETRIES; attempt++) {
