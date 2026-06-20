@@ -59,33 +59,60 @@ function connectBinance() {
 }
 
 const https = require('https');
-const leverageCache = new Set(); // символи де вже встановили плече
+const httpsAgent = new https.Agent({ keepAlive: true });
+const leverageCache = new Set();
+const knownSymbols = new Set();
 
-async function setLeverage(symbol, leverage = 10) {
-  if (leverageCache.has(symbol)) return; // вже встановлено
+async function setLeverageForSymbol(symbol) {
+  if (leverageCache.has(symbol)) return;
   const ts = Date.now();
-  const params = { symbol, leverage: String(leverage), timestamp: ts };
-  const sorted = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
-  const sig = crypto.createHmac('sha256', SECRET).update(sorted).digest('hex');
+  const params = `leverage=10&symbol=${symbol}&timestamp=${ts}`;
+  const sig = crypto.createHmac('sha256', SECRET).update(params).digest('hex');
   
   return new Promise((resolve) => {
     const req = https.request({
       hostname: 'fapi.binance.com',
-      path: `/fapi/v1/leverage?${sorted}&signature=${sig}`,
+      path: `/fapi/v1/leverage?${params}&signature=${sig}`,
       method: 'POST',
-      headers: { 'X-MBX-APIKEY': KEY }
+      headers: { 'X-MBX-APIKEY': KEY },
+      agent: httpsAgent
     }, (res) => {
-      let d = '';
-      res.on('data', x => d += x);
-      res.on('end', () => {
-        leverageCache.add(symbol);
-        log(`Leverage set: ${symbol} ${leverage}x`);
-        resolve();
-      });
+      res.on('data', () => {});
+      res.on('end', () => { leverageCache.add(symbol); resolve(); });
     });
     req.on('error', () => resolve());
     req.end();
   });
+}
+
+async function updateAllLeverage() {
+  try {
+    const r = await new Promise((resolve, reject) => {
+      https.get('https://fapi.binance.com/fapi/v1/exchangeInfo', { agent: httpsAgent }, (res) => {
+        let d = '';
+        res.on('data', x => d += x);
+        res.on('end', () => resolve(JSON.parse(d)));
+      }).on('error', reject);
+    });
+
+    const symbols = r.symbols.filter(s => s.status === 'TRADING' && /^[A-Z0-9]+$/.test(s.symbol)).map(s => s.symbol);
+    const newSymbols = symbols.filter(s => !knownSymbols.has(s));
+    
+    if (newSymbols.length > 0) {
+      log(`Setting leverage 10x for ${newSymbols.length} new symbols...`);
+      for (const sym of newSymbols) {
+        await setLeverageForSymbol(sym);
+        knownSymbols.add(sym);
+      }
+      log(`Leverage 10x set for all ${knownSymbols.size} symbols ✅`);
+    }
+  } catch(e) {
+    log(`updateAllLeverage error: ${e.message}`);
+  }
+}
+
+async function setLeverage(symbol) {
+  await setLeverageForSymbol(symbol);
 }
 
 function placeOrder(symbol, quantity, side = 'BUY') {
@@ -175,5 +202,9 @@ server.listen(SOCKET_PATH, () => {
 });
 
 connectBinance();
+
+// Встановлюємо плече для всіх контрактів при старті і оновлюємо кожні 5 хвилин
+updateAllLeverage();
+setInterval(updateAllLeverage, 5 * 60 * 1000);
 
 log('Starting Binance WS Service (Node.js)...');
