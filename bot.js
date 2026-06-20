@@ -23,6 +23,84 @@ const keepAliveAgent = new https.Agent({
   timeout: 30000,
 });
 
+// ─── Binance Futures WS напряму ───────────────────────────────────────────────
+const BINANCE_KEY = process.env.BINANCE_API_KEY || '';
+const BINANCE_SECRET = process.env.BINANCE_API_SECRET || '';
+let binanceWs = null;
+let binanceConnected = false;
+let binanceReqCounter = 0;
+const binancePending = new Map();
+const binanceFuturesCache = new Set(); // кеш контрактів Binance
+
+function signBinance(params) {
+  const sorted = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
+  return crypto.createHmac('sha256', BINANCE_SECRET).update(sorted).digest('hex');
+}
+
+function connectBinanceWS() {
+  if (!BINANCE_KEY || !BINANCE_SECRET) return;
+  binanceWs = new WebSocket('wss://ws-fapi.binance.com/ws-fapi/v1');
+  binanceWs.on('open', () => {
+    binanceConnected = true;
+    log('INFO', '[BinanceWS] Connected ✅');
+  });
+  binanceWs.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      const id = msg.id;
+      if (id && binancePending.has(id)) {
+        const { resolve } = binancePending.get(id);
+        binancePending.delete(id);
+        resolve(msg);
+      }
+    } catch(e) {}
+  });
+  binanceWs.on('close', () => {
+    binanceConnected = false;
+    log('WARN', '[BinanceWS] Disconnected — reconnecting in 1s...');
+    setTimeout(connectBinanceWS, 1000);
+  });
+  binanceWs.on('error', e => log('ERROR', `[BinanceWS] ${e.message}`));
+  binanceWs.on('ping', data => binanceWs.pong(data));
+}
+
+function openOrderBinanceWS(symbol, quantity, side = 'BUY') {
+  return new Promise((resolve, reject) => {
+    if (!binanceConnected || !binanceWs) return reject(new Error('Binance WS not connected'));
+    binanceReqCounter++;
+    const id = `order-${binanceReqCounter}`;
+    const ts = Date.now();
+    const params = {
+      apiKey: BINANCE_KEY,
+      quantity: String(quantity),
+      side: side.toUpperCase(),
+      symbol: symbol.toUpperCase(),
+      timestamp: ts,
+      type: 'MARKET',
+    };
+    params.signature = signBinance(params);
+    binancePending.set(id, { resolve, reject });
+    binanceWs.send(JSON.stringify({ id, method: 'order.place', params }));
+    setTimeout(() => {
+      if (binancePending.has(id)) {
+        binancePending.delete(id);
+        reject(new Error('Binance WS timeout'));
+      }
+    }, 5000);
+  });
+}
+
+async function updateBinanceFuturesCache() {
+  try {
+    const r = await axios.get('https://fapi.binance.com/fapi/v1/exchangeInfo');
+    binanceFuturesCache.clear();
+    r.data.symbols.filter(s => s.status === 'TRADING').forEach(s => binanceFuturesCache.add(s.symbol));
+    log('INFO', `[BinanceWS] Futures cache: ${binanceFuturesCache.size} contracts`);
+  } catch(e) {
+    log('WARN', `[BinanceWS] Cache update failed: ${e.message}`);
+  }
+}
+
 const CONFIG = {
   GATE_API_KEY:     process.env.GATE_API_KEY     || '',
   GATE_API_SECRET:  process.env.GATE_API_SECRET  || '',
@@ -333,10 +411,31 @@ function openOrderViaWS(contract, size) {
 }
 
 async function openOrderWithRetry(contract, size) {
-  // Спробуємо WS і REST паралельно — хто перший той і відкриє
+  const ticker = contract.replace('_USDT', '');
+  const binanceSymbol = ticker + 'USDT';
+
+  // Спробуємо Binance WS якщо є контракт (~3-5ms)
+  if (binanceConnected && binanceFuturesCache.has(binanceSymbol)) {
+    try {
+      const start = Date.now();
+      const r = await axios.get(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${binanceSymbol}`);
+      const price = parseFloat(r.data.price);
+      const quantity = Math.max(1, Math.round((size * 0.1) / price * 10) / 10);
+      const result = await openOrderBinanceWS(binanceSymbol, quantity, 'BUY');
+      if (result.status === 200) {
+        const elapsed = Date.now() - start;
+        log('INFO', `Order via Binance WS: ${result.result?.avgPrice || '0'} (${elapsed}ms)`);
+        return { fill_price: result.result?.avgPrice || '0' };
+      }
+    } catch(e) {
+      log('WARN', `Binance WS failed: ${e.message} — falling back to Gate.io`);
+    }
+  }
+
+  // Спробуємо Gate.io WS (~45ms)
   try {
     const wsResult = await openOrderViaWS(contract, size);
-    log('INFO', `Order via WS: ${wsResult.fill_price} (${wsResult.elapsed_ms?.toFixed(0)}ms)`);
+    log('INFO', `Order via Gate.io WS: ${wsResult.fill_price} (${wsResult.elapsed_ms?.toFixed(0)}ms)`);
     return { fill_price: wsResult.fill_price };
   } catch(e) {
     log('WARN', `WS failed: ${e.message} — using REST`);
@@ -636,6 +735,12 @@ async function main() {
   // Запускаємо WS кеш цін і балансу
   startPriceWS();
   startBalanceWS();
+  // Binance WS для швидкого відкриття (~3-5ms)
+  if (BINANCE_KEY && BINANCE_SECRET) {
+    connectBinanceWS();
+    await updateBinanceFuturesCache();
+    setInterval(updateBinanceFuturesCache, 5 * 60 * 1000);
+  }
 
   // Завантажуємо кеш контрактів
   await updateContractsCache();
