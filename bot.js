@@ -459,8 +459,14 @@ async function openOrderWithRetry(contract, size) {
   }
 
   const results = await Promise.all(promises);
-  const success = results.filter(r => r && r.success);
+  const success = results.filter(r => r && r.success && r.fill_price && r.fill_price !== '0');
   if (success.length > 0) return success[0];
+
+  // Якщо fill_price = 0 але success = true — ордер не виконався IOC
+  const partialSuccess = results.filter(r => r && r.success);
+  if (partialSuccess.length > 0) {
+    log('WARN', 'Order accepted but fill_price=0 — IOC not filled, retrying...');
+  }
 
   // WS retry — ще раз через Gate.io WS без затримки
   log('WARN', 'First attempt failed — retrying via Gate.io WS...');
