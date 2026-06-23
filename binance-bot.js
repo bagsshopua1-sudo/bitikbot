@@ -109,17 +109,28 @@ const contractsCache = new Map();
 const leverageSetGate = new Set(); // контракти яким вже виставлено плече
 let contractsCacheUpdatedAt = 0;
 const CONTRACTS_TTL = 5 * 60 * 1000; // 5 хвилин
+const DESIRED_LEVERAGE = 15; // бажане плече, якщо контракт не тягне — менше
 
 // Виставляє плече для контракту один раз, запам'ятовує в Set
 async function setLeverageGate(contract) {
   if (leverageSetGate.has(contract)) return; // вже виставлено
   try {
     await gateRequest('POST', `/futures/usdt/positions/${contract}/leverage`,
-      { leverage: '0', cross_leverage_limit: String(CONFIG.LEVERAGE) }, null
+      { leverage: '0', cross_leverage_limit: String(DESIRED_LEVERAGE) }, null
     );
     leverageSetGate.add(contract);
   } catch(e) {
-    log('WARN', `Leverage ${contract}: ${e.response?.data?.message || e.message}`);
+    const msg = e.response?.data?.message || e.message;
+    const m = msg.match(/\[1,\s*(\d+)\]/);
+    if (m) {
+      try {
+        await gateRequest('POST', `/futures/usdt/positions/${contract}/leverage`,
+          { leverage: '0', cross_leverage_limit: m[1] }, null);
+        leverageSetGate.add(contract);
+      } catch(e2) { log('WARN', `Leverage ${contract}: ${e2.message}`); }
+    } else {
+      log('WARN', `Leverage ${contract}: ${msg}`);
+    }
   }
 }
 
@@ -235,6 +246,43 @@ async function openOrderWithRetry(contract, size) {
 }
 
 // ─── Відкриття позиції ────────────────────────────────────────────────────────
+// ─── Захист позиції Binance-анонси: біржові TP +7% / SL -2% (ПІСЛЯ відкриття) ─
+async function setupProtectionBinance(contract, size, entryPrice, isShort) {
+  try {
+    const absSize = Math.abs(size);
+    const closeSize = isShort ? absSize : -absSize; // закрити = протилежна сторона
+    // SL -2% ціни, TP +7% ціни (від напрямку)
+    const slPrice = (entryPrice * (isShort ? 1.02 : 0.98)).toFixed(8);
+    const tpPrice = (entryPrice * (isShort ? 0.93 : 1.07)).toFixed(8);
+
+    gateRequest('POST', '/futures/usdt/price_orders', null, {
+      initial: { contract, size: closeSize, price: '0', tif: 'ioc', reduce_only: true, text: 't-sl-auto' },
+      trigger: { strategy_type: 0, price_type: 1, price: slPrice, rule: isShort ? 1 : 2, expiration: 86400 }
+    }).then(()=>log('INFO', `[Protect] SL ${contract} @ ${slPrice}`))
+      .catch(e=>log('WARN', `[Protect] SL fail: ${e.response?.data?.message||e.message}`));
+
+    gateRequest('POST', '/futures/usdt/price_orders', null, {
+      initial: { contract, size: closeSize, price: '0', tif: 'ioc', reduce_only: true, text: 't-tp-auto' },
+      trigger: { strategy_type: 0, price_type: 1, price: tpPrice, rule: isShort ? 2 : 1, expiration: 86400 }
+    }).then(()=>log('INFO', `[Protect] TP ${contract} @ ${tpPrice}`))
+      .catch(e=>log('WARN', `[Protect] TP fail: ${e.response?.data?.message||e.message}`));
+
+    // Безубиток через 7 хв якщо ще відкрито
+    setTimeout(async () => {
+      try {
+        const pos = await gateRequest('GET', `/futures/usdt/positions/${contract}`, null, null).catch(()=>null);
+        if (!pos || parseInt(pos.size) === 0) return;
+        gateRequest('POST', '/futures/usdt/price_orders', null, {
+          initial: { contract, size: closeSize, price: '0', tif: 'ioc', reduce_only: true, text: 't-be' },
+          trigger: { strategy_type: 0, price_type: 1, price: entryPrice.toFixed(8), rule: isShort ? 1 : 2, expiration: 86400 }
+        }).catch(()=>{});
+      } catch(e) {}
+    }, 7*60*1000);
+  } catch(e) {
+    log('ERROR', `[Protect] binance setup error: ${e.message}`);
+  }
+}
+
 async function openPosition(ticker, marginPercent, seenAt, isShort = false, sharedBalance = null, contractData = null) {
   if (processedTickers.has(ticker)) return false;
   processedTickers.set(ticker, Date.now());
@@ -264,7 +312,7 @@ async function openPosition(ticker, marginPercent, seenAt, isShort = false, shar
   }
 
   const useMargin = available * (marginPercent / 100);
-  const absSize = Math.max(1, Math.floor((useMargin * CONFIG.LEVERAGE) / (markPrice * quanto)));
+  const absSize = Math.max(1, Math.floor((useMargin * DESIRED_LEVERAGE) / (markPrice * quanto)));
   const size = isShort ? -absSize : absSize;
   const posValue = (absSize * markPrice * quanto).toFixed(2);
 
@@ -291,12 +339,15 @@ async function openPosition(ticker, marginPercent, seenAt, isShort = false, shar
     `📄 Контракт:   ${contract}\n` +
     `💵 Ціна входу: ${entryPrice} USDT\n` +
     `📊 Розмір:     $${posValue} (${marginPercent}%)\n` +
-    `⚡️ Плече:      ${CONFIG.LEVERAGE}x\n` +
+    `⚡️ Плече:      ${DESIRED_LEVERAGE}x\n` +
     `⏱ Швидкість:   ${elapsedSec} сек\n` +
     `─────────────────────`
   );
 
   log('INFO', `Opened ${contract} entry=${entryPrice} speed=${elapsedSec}s`);
+
+  // Захист — ПІСЛЯ відкриття, БЕЗ await (не блокує). Ізольовано.
+  setupProtectionBinance(contract, size, entryPrice, isShort);
   return true;
 }
 
