@@ -489,6 +489,139 @@ async function openOrderWithRetry(contract, size) {
   }
 }
 
+// ─── Кеш плеча Gate.io (прибрати 400 через гонку плеча) ──────────────────────
+const leverageSetGate = new Set();
+const DESIRED_LEVERAGE = 15; // бажане плече, якщо контракт не тягне — буде менше
+
+async function setLeverageGate(contract) {
+  if (leverageSetGate.has(contract)) return;
+  try {
+    await gateRequest('POST', `/futures/usdt/positions/${contract}/leverage`,
+      { leverage: '0', cross_leverage_limit: String(DESIRED_LEVERAGE) }, null);
+    leverageSetGate.add(contract);
+  } catch(e) {
+    // якщо контракт не тягне 15x — пробуємо менше
+    const msg = e.response?.data?.message || e.message;
+    const m = msg.match(/\[1,\s*(\d+)\]/);
+    if (m) {
+      const maxLev = m[1];
+      try {
+        await gateRequest('POST', `/futures/usdt/positions/${contract}/leverage`,
+          { leverage: '0', cross_leverage_limit: maxLev }, null);
+        leverageSetGate.add(contract);
+        log('INFO', `Leverage ${contract}: max ${maxLev}x`);
+      } catch(e2) { log('WARN', `Leverage ${contract}: ${e2.message}`); }
+    } else {
+      log('WARN', `Leverage ${contract}: ${msg}`);
+    }
+  }
+}
+
+async function prewarmLeverageGate() {
+  const contracts = [...contractsCache.keys()].filter(c => !leverageSetGate.has(c));
+  if (contracts.length === 0) return;
+  log('INFO', `Prewarming Gate leverage for ${contracts.length} contracts...`);
+  for (let i = 0; i < contracts.length; i += 10) {
+    await Promise.all(contracts.slice(i, i+10).map(c => setLeverageGate(c)));
+    await new Promise(r => setTimeout(r, 200));
+  }
+  log('INFO', `Gate leverage prewarmed: ${leverageSetGate.size} ready`);
+}
+
+// ─── Захист позиції: біржові SL/TP + трейлінг (ПІСЛЯ відкриття, ізольовано) ───
+// НЕ блокує відкриття. Викликається без await. Усе в try-catch.
+async function setupProtection(contract, size, entryPrice, quanto) {
+  try {
+    const isLong = size > 0;
+    const absSize = Math.abs(size);
+    // SL -2% ціни, TP +14% ціни (Upbit Gate.io)
+    const slPrice = (entryPrice * (isLong ? 0.98 : 1.02)).toFixed(8);
+    const tpPrice = (entryPrice * (isLong ? 1.14 : 0.86)).toFixed(8);
+    const closeSize = isLong ? -absSize : absSize;
+
+    // Біржовий SL (price_orders, trigger)
+    gateRequest('POST', '/futures/usdt/price_orders', null, {
+      initial: { contract, size: closeSize, price: '0', tif: 'ioc', reduce_only: true, text: 't-sl-auto' },
+      trigger: { strategy_type: 0, price_type: 1, price: slPrice, rule: isLong ? 2 : 1, expiration: 86400 }
+    }).then(()=>log('INFO', `[Protect] SL ${contract} @ ${slPrice}`))
+      .catch(e=>log('WARN', `[Protect] SL fail: ${e.response?.data?.message||e.message}`));
+
+    // Біржовий TP
+    gateRequest('POST', '/futures/usdt/price_orders', null, {
+      initial: { contract, size: closeSize, price: '0', tif: 'ioc', reduce_only: true, text: 't-tp-auto' },
+      trigger: { strategy_type: 0, price_type: 1, price: tpPrice, rule: isLong ? 1 : 2, expiration: 86400 }
+    }).then(()=>log('INFO', `[Protect] TP ${contract} @ ${tpPrice}`))
+      .catch(e=>log('WARN', `[Protect] TP fail: ${e.response?.data?.message||e.message}`));
+
+    // Трейлінг 1.5% через 500мс (моніторинг ботом, ізольовано)
+    setTimeout(() => startTrailing(contract, entryPrice, isLong, closeSize), 500);
+
+    // Безубиток через 7 хв якщо ще відкрито
+    setTimeout(() => moveToBreakeven(contract, entryPrice, isLong, closeSize), 7*60*1000);
+  } catch(e) {
+    log('ERROR', `[Protect] setup error: ${e.message}`);
+  }
+}
+
+const trailingActive = new Map(); // contract → true поки трейлінг працює
+
+function startTrailing(contract, entryPrice, isLong, closeSize) {
+  try {
+    if (trailingActive.get(contract)) return;
+    trailingActive.set(contract, true);
+    const TRAIL = 0.015; // 1.5%
+    let peak = entryPrice;
+    log('INFO', `[Trail] ${contract} активний (1.5%)`);
+
+    const iv = setInterval(async () => {
+      try {
+        const cached = priceCache.get(contract);
+        if (!cached) return;
+        const price = cached.markPrice;
+        if (isLong) {
+          if (price > peak) peak = price;
+          if (price <= peak * (1 - TRAIL)) {
+            clearInterval(iv); trailingActive.delete(contract);
+            log('INFO', `[Trail] ${contract} закриваємо @ ${price} (відкат від піка ${peak})`);
+            gateRequest('POST', '/futures/usdt/orders', null,
+              { contract, size: closeSize, price: '0', tif: 'ioc', reduce_only: true, text: 't-trail' })
+              .catch(e=>log('WARN', `[Trail] close fail: ${e.message}`));
+          }
+        } else {
+          if (price < peak) peak = price;
+          if (price >= peak * (1 + TRAIL)) {
+            clearInterval(iv); trailingActive.delete(contract);
+            gateRequest('POST', '/futures/usdt/orders', null,
+              { contract, size: closeSize, price: '0', tif: 'ioc', reduce_only: true, text: 't-trail' })
+              .catch(e=>log('WARN', `[Trail] close fail: ${e.message}`));
+          }
+        }
+      } catch(e) {}
+    }, 200);
+
+    // зупинити трейлінг через 30 хв в будь-якому разі
+    setTimeout(() => { clearInterval(iv); trailingActive.delete(contract); }, 30*60*1000);
+  } catch(e) {
+    log('ERROR', `[Trail] error: ${e.message}`);
+  }
+}
+
+async function moveToBreakeven(contract, entryPrice, isLong, closeSize) {
+  try {
+    // перевіряємо чи позиція ще відкрита
+    const pos = await gateRequest('GET', `/futures/usdt/positions/${contract}`, null, null).catch(()=>null);
+    if (!pos || parseInt(pos.size) === 0) return; // вже закрита
+    const bePrice = entryPrice.toFixed(8);
+    gateRequest('POST', '/futures/usdt/price_orders', null, {
+      initial: { contract, size: closeSize, price: '0', tif: 'ioc', reduce_only: true, text: 't-be' },
+      trigger: { strategy_type: 0, price_type: 1, price: bePrice, rule: isLong ? 2 : 1, expiration: 86400 }
+    }).then(()=>log('INFO', `[BE] ${contract} безубиток @ ${bePrice}`))
+      .catch(e=>log('WARN', `[BE] fail: ${e.message}`));
+  } catch(e) {
+    log('ERROR', `[BE] error: ${e.message}`);
+  }
+}
+
 async function handleNewListing(ticker, seenAt) {
   if (processedTickers.has(ticker)) return;
   processedTickers.set(ticker, Date.now());
@@ -513,12 +646,13 @@ async function handleNewListing(ticker, seenAt) {
 
   const { contract, markPrice, quanto } = contractData;
 
-  gateRequest('POST', `/futures/usdt/positions/${contract}/leverage`,
-    { leverage: '0', cross_leverage_limit: String(CONFIG.LEVERAGE) }, null
-  ).catch(e => log('WARN', `Leverage: ${e.response?.data?.message || e.message}`));
+  // Плече: якщо вже прогріте — пропускаємо (0ms), якщо ні — виставляємо до ордера
+  if (!leverageSetGate.has(contract)) {
+    await setLeverageGate(contract);
+  }
 
   const targetMargin = available * 0.65;
-  let size = Math.max(1, Math.floor((targetMargin * CONFIG.LEVERAGE) / (markPrice * quanto)));
+  let size = Math.max(1, Math.floor((targetMargin * DESIRED_LEVERAGE) / (markPrice * quanto)));
   
   log('INFO', `Size calc: available=${available} target_margin=${targetMargin.toFixed(2)} size=${size} est_margin=${(size*markPrice*quanto/CONFIG.LEVERAGE).toFixed(2)}`);
   const posValue = (size * markPrice * quanto).toFixed(2);
@@ -556,6 +690,9 @@ async function handleNewListing(ticker, seenAt) {
   );
 
   log('INFO', `Opened ${contract} entry=${entryPrice} speed=${elapsedSec}s`);
+
+  // Захист позиції — ПІСЛЯ відкриття, БЕЗ await (не блокує). Усе ізольовано в try-catch.
+  setupProtection(contract, size, entryPrice, quanto);
 }
 
 // ─── Upbit анонси через проксі ────────────────────────────────────────────────
@@ -774,7 +911,9 @@ async function main() {
 
   // Завантажуємо кеш контрактів
   await updateContractsCache();
+  await prewarmLeverageGate(); // виставляємо плече всім контрактам заздалегідь
   setInterval(updateContractsCache, CONTRACTS_TTL);
+  setInterval(prewarmLeverageGate, 5 * 60 * 1000); // нові контракти кожні 5 хв
 
   // CoinListing WebSocket — міттєві лістинги Upbit
   startCoinListingWS();
