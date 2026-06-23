@@ -106,8 +106,35 @@ async function gateRequest(method, endpoint, query, data) {
 
 // ─── Кеш контрактів Gate.io ───────────────────────────────────────────────────
 const contractsCache = new Map();
+const leverageSetGate = new Set(); // контракти яким вже виставлено плече
 let contractsCacheUpdatedAt = 0;
 const CONTRACTS_TTL = 5 * 60 * 1000; // 5 хвилин
+
+// Виставляє плече для контракту один раз, запам'ятовує в Set
+async function setLeverageGate(contract) {
+  if (leverageSetGate.has(contract)) return; // вже виставлено
+  try {
+    await gateRequest('POST', `/futures/usdt/positions/${contract}/leverage`,
+      { leverage: '0', cross_leverage_limit: String(CONFIG.LEVERAGE) }, null
+    );
+    leverageSetGate.add(contract);
+  } catch(e) {
+    log('WARN', `Leverage ${contract}: ${e.response?.data?.message || e.message}`);
+  }
+}
+
+// Прогріває плече для нових контрактів у фоні (порціями, щоб не вдарити rate-limit)
+async function prewarmLeverage() {
+  const contracts = [...contractsCache.keys()].filter(c => !leverageSetGate.has(c));
+  if (contracts.length === 0) return;
+  log('INFO', `Prewarming leverage for ${contracts.length} new contracts...`);
+  for (let i = 0; i < contracts.length; i += 10) {
+    const batch = contracts.slice(i, i + 10);
+    await Promise.all(batch.map(c => setLeverageGate(c)));
+    await new Promise(r => setTimeout(r, 200));
+  }
+  log('INFO', `Leverage prewarmed: ${leverageSetGate.size} contracts ready`);
+}
 
 async function updateContractsCache() {
   try {
@@ -123,6 +150,7 @@ async function updateContractsCache() {
     }
     contractsCacheUpdatedAt = Date.now();
     log('INFO', `Contracts cache updated: ${contractsCache.size} contracts`);
+    prewarmLeverage(); // фоном виставляємо плече новим контрактам
   } catch(e) {
     log('ERROR', `Contracts cache update failed: ${e.message}`);
   }
@@ -229,10 +257,11 @@ async function openPosition(ticker, marginPercent, seenAt, isShort = false, shar
 
   const { contract, markPrice, quanto } = resolvedContract;
 
-  // Плече паралельно (не чекаємо)
-  gateRequest('POST', `/futures/usdt/positions/${contract}/leverage`,
-    { leverage: '0', cross_leverage_limit: String(CONFIG.LEVERAGE) }, null
-  ).catch(e => log('WARN', `Leverage: ${e.response?.data?.message || e.message}`));
+  // Плече: якщо контракт уже прогрітий — пропускаємо (0ms),
+  // якщо свіжий (немає в кеші) — виставляємо ДО ордера щоб уникнути 400
+  if (!leverageSetGate.has(contract)) {
+    await setLeverageGate(contract);
+  }
 
   const useMargin = available * (marginPercent / 100);
   const absSize = Math.max(1, Math.floor((useMargin * CONFIG.LEVERAGE) / (markPrice * quanto)));
@@ -452,6 +481,7 @@ async function main() {
 
   // Завантажуємо кеш контрактів
   await updateContractsCache();
+  await prewarmLeverage(); // виставляємо плече всім контрактам при старті
   setInterval(updateContractsCache, CONTRACTS_TTL);
 
   // WebSocket — основний канал
